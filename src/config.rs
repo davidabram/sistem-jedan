@@ -43,20 +43,8 @@ pub enum ConfigError {
     InvalidEndpoint,
     #[error("provider.model must not be empty")]
     EmptyModel,
-    #[error("provider.api_key and provider.api_key_env are mutually exclusive")]
-    ConflictingCredentials,
-    #[error("one of provider.api_key or provider.api_key_env is required")]
-    MissingCredentials,
     #[error("provider.api_key must not be empty")]
     EmptyApiKey,
-    #[error("provider.api_key_env must name an environment variable")]
-    InvalidApiKeyEnv,
-    #[error("environment variable {0} is not set")]
-    ApiKeyEnvMissing(String),
-    #[error("environment variable {0} is not valid UTF-8")]
-    ApiKeyEnvNotUnicode(String),
-    #[error("environment variable {0} is empty")]
-    ApiKeyEnvEmpty(String),
     #[error("execution.timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}")]
     InvalidTimeout,
     #[error("execution.memory_limit_mb must be at least 1 and fit in addressable memory")]
@@ -80,21 +68,6 @@ impl fmt::Debug for ApiKey {
 }
 
 #[derive(Debug)]
-pub enum CredentialSource {
-    Inline,
-    Environment(String),
-}
-
-impl fmt::Display for CredentialSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Inline => f.write_str("api_key"),
-            Self::Environment(name) => write!(f, "api_key_env={name}"),
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct Provider {
     pub endpoint: String,
     pub model: String,
@@ -103,7 +76,6 @@ pub struct Provider {
         reason = "read by the hosted inference client, which is not implemented yet"
     )]
     pub api_key: ApiKey,
-    pub credential_source: CredentialSource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,8 +121,7 @@ struct RawConfig {
 struct RawProvider {
     endpoint: String,
     model: String,
-    api_key: Option<String>,
-    api_key_env: Option<String>,
+    api_key: String,
 }
 
 #[derive(Deserialize)]
@@ -205,37 +176,14 @@ impl RawProvider {
         if self.model.trim().is_empty() {
             return Err(ConfigError::EmptyModel);
         }
-        let (api_key, credential_source) = match (self.api_key, self.api_key_env) {
-            (Some(_), Some(_)) => return Err(ConfigError::ConflictingCredentials),
-            (None, None) => return Err(ConfigError::MissingCredentials),
-            (Some(key), None) => {
-                if key.trim().is_empty() {
-                    return Err(ConfigError::EmptyApiKey);
-                }
-                (key, CredentialSource::Inline)
-            }
-            (None, Some(name)) => (resolve_env(&name)?, CredentialSource::Environment(name)),
-        };
+        if self.api_key.trim().is_empty() {
+            return Err(ConfigError::EmptyApiKey);
+        }
         Ok(Provider {
             endpoint: self.endpoint,
             model: self.model,
-            api_key: ApiKey(api_key),
-            credential_source,
+            api_key: ApiKey(self.api_key),
         })
-    }
-}
-
-fn resolve_env(name: &str) -> Result<String, ConfigError> {
-    if name.is_empty() || name.contains(['=', '\0']) {
-        return Err(ConfigError::InvalidApiKeyEnv);
-    }
-    match std::env::var(name) {
-        Ok(value) if value.trim().is_empty() => Err(ConfigError::ApiKeyEnvEmpty(name.to_owned())),
-        Ok(value) => Ok(value),
-        Err(std::env::VarError::NotPresent) => Err(ConfigError::ApiKeyEnvMissing(name.to_owned())),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(ConfigError::ApiKeyEnvNotUnicode(name.to_owned()))
-        }
     }
 }
 

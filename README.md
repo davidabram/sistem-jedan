@@ -27,7 +27,7 @@ Configuration is read from `--config <path>` (or `--config=<path>`), otherwise f
 [provider]
 endpoint = "https://provider.example/v1/decisions"
 model = "configured-model"
-api_key_env = "SYSTEM1_API_KEY"
+api_key = "<your API key>"
 
 [execution]
 timeout_seconds = 5
@@ -36,9 +36,9 @@ max_concurrent_requests = 8
 max_calls_per_execution = 32
 ```
 
-`[provider]` describes the hosted System 1 Decisions API and is required in a configuration file. `endpoint` must be an `https` URL without embedded credentials. Set exactly one of `api_key` (inline) or `api_key_env` (the name of an environment variable holding the key). `[execution]` and each of its fields are optional and default to the values shown; `timeout_seconds` must be between 1 and 3600, and every other value must be at least 1. Unknown keys are rejected.
+`[provider]` describes the hosted System 1 Decisions API and is required in a configuration file. `endpoint` must be an `https` URL without embedded credentials. `api_key` holds the API key; since the file contains a secret, restrict it with `chmod 600`. `[execution]` and each of its fields are optional and default to the values shown; `timeout_seconds` must be between 1 and 3600, and every other value must be at least 1. Unknown keys are rejected.
 
-The configuration is validated and the credential is resolved at startup; any problem is logged and the process exits with an error. The credential is never logged, never returned in MCP responses, and never made visible to JavaScript. Hosted inference itself is not implemented yet, so `max_concurrent_requests` and `max_calls_per_execution` are validated but not yet enforced.
+The configuration is validated at startup; any problem is logged and the process exits with an error. The API key is never logged, never returned in MCP responses, and never made visible to JavaScript. Hosted inference itself is not implemented yet, so `max_concurrent_requests` and `max_calls_per_execution` are validated but not yet enforced.
 
 ## Claude Code integration
 

@@ -39,7 +39,6 @@ async fn main() -> Result<(), Error> {
             path = %file.path.display(),
             endpoint = file.provider.endpoint,
             model = file.provider.model,
-            credentials = %file.provider.credential_source,
             "loaded configuration"
         );
     } else {
