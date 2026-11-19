@@ -1,4 +1,9 @@
 mod config;
+#[expect(
+    dead_code,
+    reason = "the Decisions client is connected to JavaScript later"
+)]
+mod decisions;
 mod js;
 mod mcp;
 
@@ -37,7 +42,7 @@ async fn main() -> Result<(), Error> {
     if let Some(file) = &config.file {
         tracing::info!(
             path = %file.path.display(),
-            endpoint = file.provider.endpoint,
+            endpoint = %file.provider.endpoint,
             model = file.provider.model,
             "loaded configuration"
         );

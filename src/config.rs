@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::Url;
 use serde::Deserialize;
 
 use crate::js::Limits;
@@ -39,7 +40,9 @@ pub enum ConfigError {
         line: Option<usize>,
         message: String,
     },
-    #[error("provider.endpoint must be an https URL with a host and no embedded credentials")]
+    #[error(
+        "provider.endpoint must be an https URL with a host and no embedded credentials, query string or fragment"
+    )]
     InvalidEndpoint,
     #[error("provider.model must not be empty")]
     EmptyModel,
@@ -55,11 +58,13 @@ pub enum ConfigError {
     InvalidMaxCallsPerExecution,
 }
 
-#[expect(
-    dead_code,
-    reason = "read by the hosted inference client, which is not implemented yet"
-)]
 pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -69,12 +74,8 @@ impl fmt::Debug for ApiKey {
 
 #[derive(Debug)]
 pub struct Provider {
-    pub endpoint: String,
+    pub endpoint: Url,
     pub model: String,
-    #[expect(
-        dead_code,
-        reason = "read by the hosted inference client, which is not implemented yet"
-    )]
     pub api_key: ApiKey,
 }
 
@@ -170,9 +171,7 @@ impl RawExecution {
 
 impl RawProvider {
     fn validate(self) -> Result<Provider, ConfigError> {
-        if !is_valid_endpoint(&self.endpoint) {
-            return Err(ConfigError::InvalidEndpoint);
-        }
+        let endpoint = parse_endpoint(&self.endpoint).ok_or(ConfigError::InvalidEndpoint)?;
         if self.model.trim().is_empty() {
             return Err(ConfigError::EmptyModel);
         }
@@ -180,23 +179,32 @@ impl RawProvider {
             return Err(ConfigError::EmptyApiKey);
         }
         Ok(Provider {
-            endpoint: self.endpoint,
+            endpoint,
             model: self.model,
             api_key: ApiKey(self.api_key),
         })
     }
 }
 
-fn is_valid_endpoint(endpoint: &str) -> bool {
-    let Some(rest) = endpoint.strip_prefix("https://") else {
-        return false;
-    };
+fn parse_endpoint(endpoint: &str) -> Option<Url> {
+    let rest = endpoint.strip_prefix("https://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty()
-        && !authority.contains('@')
-        && !endpoint
+    if authority.is_empty()
+        || authority.contains('@')
+        || endpoint
             .chars()
             .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Url::parse(endpoint).ok().filter(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 pub fn load(args: impl IntoIterator<Item = OsString>) -> Result<Config, ConfigError> {

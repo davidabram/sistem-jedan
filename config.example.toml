@@ -1,0 +1,10 @@
+[provider]
+endpoint = "https://openrouter.ai/api/alpha/decisions"
+model = "typesafe/jev-1.14"
+api_key = "<your OpenRouter API key>"
+
+[execution]
+timeout_seconds = 5
+memory_limit_mb = 64
+max_concurrent_requests = 8
+max_calls_per_execution = 32

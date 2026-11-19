@@ -25,9 +25,9 @@ Configuration is read from `--config <path>` (or `--config=<path>`), otherwise f
 
 ```toml
 [provider]
-endpoint = "https://provider.example/v1/decisions"
-model = "configured-model"
-api_key = "<your API key>"
+endpoint = "https://openrouter.ai/api/alpha/decisions"
+model = "typesafe/jev-1.14"
+api_key = "<your OpenRouter API key>"
 
 [execution]
 timeout_seconds = 5
@@ -36,9 +36,19 @@ max_concurrent_requests = 8
 max_calls_per_execution = 32
 ```
 
-`[provider]` describes the hosted System 1 Decisions API and is required in a configuration file. `endpoint` must be an `https` URL without embedded credentials. `api_key` holds the API key; since the file contains a secret, restrict it with `chmod 600`. `[execution]` and each of its fields are optional and default to the values shown; `timeout_seconds` must be between 1 and 3600, and every other value must be at least 1. Unknown keys are rejected.
+`[provider]` describes OpenRouter's hosted System 1 [Decisions API](https://openrouter.ai/docs/guides/features/decisions) and is required in a configuration file. `endpoint` must be an `https` URL with a host and without embedded credentials, a query string or a fragment. `api_key` holds the API key; since the file contains a secret, restrict it with `chmod 600`. `[execution]` and each of its fields are optional and default to the values shown; `timeout_seconds` must be between 1 and 3600, and every other value must be at least 1. Unknown keys are rejected.
 
-The configuration is validated at startup; any problem is logged and the process exits with an error. The API key is never logged, never returned in MCP responses, and never made visible to JavaScript. Hosted inference itself is not implemented yet, so `max_concurrent_requests` and `max_calls_per_execution` are validated but not yet enforced.
+The configuration is validated at startup; any problem is logged and the process exits with an error. The API key is never logged, never returned in MCP responses, and never made visible to JavaScript. A typed Decisions API client (`noul`, `choice` and `score` questions) exists but is not yet reachable from JavaScript, so `max_concurrent_requests` and `max_calls_per_execution` are validated but not yet enforced.
+
+To install the configuration, copy [`config.example.toml`](config.example.toml) to the XDG path with owner-only permissions, then replace the placeholder API key:
+
+```sh
+install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan"
+install -m 600 config.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan/config.toml"
+"${EDITOR:-vi}" "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan/config.toml"
+```
+
+A repository-local `config.toml` (for use with `--config config.toml`) is ignored by Git.
 
 ## Claude Code integration
 
