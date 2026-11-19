@@ -11,6 +11,10 @@ use crate::config::Provider;
 const MAX_QUESTION_NAME_LEN: usize = 64;
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MIN_CHOICES: usize = 2;
+const MIN_SCORE_LEVELS: usize = 2;
+const MAX_NESTING_DEPTH: usize = 64;
 const REDACTED: &str = "<redacted>";
 
 /// A Decisions API request: the `state` to judge and the named questions to answer about it.
@@ -134,10 +138,16 @@ pub enum RequestError {
     InvalidQuestionName(String),
     #[error("state must be a string, object or array")]
     InvalidState,
-    #[error("choice question {0:?} needs at least one choice")]
-    NoChoices(String),
-    #[error("score question {0:?} needs at least one criterion")]
-    NoCriteria(String),
+    #[error("state nests objects and arrays deeper than {MAX_NESTING_DEPTH} levels")]
+    StateTooDeep,
+    #[error("choice question {0:?} needs at least {MIN_CHOICES} choices")]
+    TooFewChoices(String),
+    #[error("score question {0:?} needs at least {MIN_SCORE_LEVELS} levels")]
+    TooFewLevels(String),
+    #[error("question {0:?} has empty instructions")]
+    EmptyInstructions(String),
+    #[error("question {question:?} has an empty description for criterion {criterion:?}")]
+    EmptyCriterion { question: String, criterion: String },
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -184,6 +194,8 @@ pub enum DecisionsError {
     Timeout(Duration),
     #[error("HTTP request failed: {0}")]
     Transport(#[source] reqwest::Error),
+    #[error("response body exceeds {MAX_RESPONSE_BYTES} bytes")]
+    ResponseTooLarge,
     #[error("authentication failed with HTTP {status}: {message}")]
     Authentication { status: StatusCode, message: String },
     #[error("Decisions API returned HTTP {status}: {message}")]
@@ -257,16 +269,33 @@ impl Client {
             .await
             .map_err(|error| self.transport(error))?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| self.transport(error))?;
+        let bytes = self.read_body(response).await?;
         if !status.is_success() {
             return Err(self.status_error(status, &bytes));
         }
         let response: Response = serde_json::from_slice(&bytes).map_err(DecisionsError::Decode)?;
         response.validate(request)?;
         Ok(response)
+    }
+
+    async fn read_body(&self, mut response: reqwest::Response) -> Result<Vec<u8>, DecisionsError> {
+        let expected = match response.content_length().map(usize::try_from) {
+            Some(Ok(length)) if length <= MAX_RESPONSE_BYTES => length,
+            Some(_) => return Err(DecisionsError::ResponseTooLarge),
+            None => 0,
+        };
+        let mut body = Vec::with_capacity(expected);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| self.transport(error))?
+        {
+            if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+                return Err(DecisionsError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     fn transport(&self, error: reqwest::Error) -> DecisionsError {
@@ -296,17 +325,20 @@ impl Client {
     }
 
     fn redact(&self, message: &str) -> String {
-        let truncated: String = message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
-        match self
+        let mut sanitized = match self
             .authorization
             .to_str()
             .ok()
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|key| !key.is_empty())
         {
-            Some(key) => truncated.replace(key, REDACTED),
-            None => truncated,
+            Some(key) => message.replace(key, REDACTED),
+            None => message.to_owned(),
+        };
+        if let Some((end, _)) = sanitized.char_indices().nth(MAX_ERROR_MESSAGE_CHARS) {
+            sanitized.truncate(end);
         }
+        sanitized
     }
 }
 
@@ -320,6 +352,9 @@ impl Request {
         ) {
             return Err(RequestError::InvalidState);
         }
+        if exceeds_depth(&self.state, MAX_NESTING_DEPTH) {
+            return Err(RequestError::StateTooDeep);
+        }
         if self.questions.is_empty() {
             return Err(RequestError::NoQuestions);
         }
@@ -327,17 +362,69 @@ impl Request {
             if !is_valid_question_name(name) {
                 return Err(RequestError::InvalidQuestionName(name.clone()));
             }
-            match question {
-                Question::Choice { criteria, .. } if criteria.is_empty() => {
-                    return Err(RequestError::NoChoices(name.clone()));
+            question.validate(name)?;
+        }
+        Ok(())
+    }
+}
+
+impl Question {
+    fn validate(&self, name: &str) -> Result<(), RequestError> {
+        let (Self::Noul { instructions, .. }
+        | Self::Choice { instructions, .. }
+        | Self::Score { instructions, .. }) = self;
+        if instructions.as_deref().is_some_and(is_blank) {
+            return Err(RequestError::EmptyInstructions(name.to_owned()));
+        }
+        let empty = |criterion: &str| RequestError::EmptyCriterion {
+            question: name.to_owned(),
+            criterion: criterion.to_owned(),
+        };
+        match self {
+            Self::Noul { criteria, .. } => {
+                if let Some(criteria) = criteria {
+                    if is_blank(&criteria.yes) {
+                        return Err(empty("true"));
+                    }
+                    if is_blank(&criteria.no) {
+                        return Err(empty("false"));
+                    }
                 }
-                Question::Score { criteria, .. } if criteria.is_empty() => {
-                    return Err(RequestError::NoCriteria(name.clone()));
+            }
+            Self::Choice { criteria, .. } => {
+                if criteria.len() < MIN_CHOICES {
+                    return Err(RequestError::TooFewChoices(name.to_owned()));
                 }
-                _ => {}
+                if let Some((choice, _)) = criteria
+                    .iter()
+                    .find(|(_, description)| is_blank(description))
+                {
+                    return Err(empty(choice));
+                }
+            }
+            Self::Score { criteria, .. } => {
+                if criteria.len() < MIN_SCORE_LEVELS {
+                    return Err(RequestError::TooFewLevels(name.to_owned()));
+                }
+                if let Some(level) = criteria.iter().position(|level| is_blank(level)) {
+                    return Err(empty(&level.to_string()));
+                }
             }
         }
         Ok(())
+    }
+}
+
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn exceeds_depth(value: &serde_json::Value, remaining: usize) -> bool {
+    let nested = |child: &serde_json::Value| exceeds_depth(child, remaining - 1);
+    match value {
+        serde_json::Value::Array(items) => remaining == 0 || items.iter().any(nested),
+        serde_json::Value::Object(fields) => remaining == 0 || fields.values().any(nested),
+        _ => false,
     }
 }
 
