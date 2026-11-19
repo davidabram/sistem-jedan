@@ -5,3 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
+rmcp = { version = "3.11.0", default-features = false, features = ["server", "transport-io"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
