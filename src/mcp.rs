@@ -8,10 +8,11 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::task::JoinError;
+use std::sync::Arc;
 
-use crate::js::{self, JsError, Limits};
+use serde_json::json;
+
+use crate::js::{self, JsError, Limits, System1};
 
 pub const EXECUTE: &str = "execute";
 
@@ -32,26 +33,28 @@ pub enum ExecuteError {
     InvalidArguments(#[source] serde_json::Error),
     #[error(transparent)]
     Js(#[from] JsError),
-    #[error("execution task failed: {0}")]
-    Task(#[from] JoinError),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Server {
     limits: Limits,
+    system1: Arc<System1>,
 }
 
 impl Server {
     #[must_use]
-    pub fn new(limits: Limits) -> Self {
-        Self { limits }
+    pub fn new(limits: Limits, system1: System1) -> Self {
+        Self {
+            limits,
+            system1: Arc::new(system1),
+        }
     }
 
-    fn execute_tool(self) -> Tool {
+    fn execute_tool(&self) -> Tool {
         Tool::new(
             EXECUTE,
             format!(
-                "Runs JavaScript in an isolated QuickJS sandbox. `code` is the body of an async function: use `await` freely and `return` a JSON-serializable value, which is returned as `result`. There is no filesystem, network, environment, or module access; each call gets a fresh context with a {} s deadline and a {} MiB memory limit. Failures return `{{\"error\": {{\"kind\", \"message\"}}}}` with `isError: true`.",
+                "Runs JavaScript in an isolated QuickJS sandbox. `code` is the body of an async function: use `await` freely and `return` a JSON-serializable value, which is returned as `result`. `await system1.decide({{ state, questions }})` asks the hosted System 1 Decisions API (`noul`, `choice` or `score` questions) and resolves to `{{ id, model, provider, answers, usage }}`; calls may run concurrently with `Promise.all`, and failures reject with an `Error` whose `kind` names the cause. There is no other network access and no filesystem, environment, or module access; each call gets a fresh context with a {} s deadline and a {} MiB memory limit. Failures return `{{\"error\": {{\"kind\", \"message\"}}}}` with `isError: true`.",
                 self.limits.timeout.as_secs(),
                 self.limits.memory_limit / (1024 * 1024),
             ),
@@ -62,15 +65,14 @@ impl Server {
     }
 
     async fn execute(
-        self,
+        &self,
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult, ExecuteError> {
         let arguments = serde_json::Value::Object(arguments.unwrap_or_default());
         let args: ExecuteArgs =
             serde_json::from_value(arguments).map_err(ExecuteError::InvalidArguments)?;
         tracing::info!(code_bytes = args.code.len(), "executing JavaScript");
-        let result =
-            tokio::task::spawn_blocking(move || js::run(&args.code, self.limits)).await??;
+        let result = js::run(&args.code, self.limits, Arc::clone(&self.system1)).await?;
         Ok(CallToolResult::structured(json!(ExecuteOutput { result })))
     }
 }
@@ -115,10 +117,6 @@ impl ServerHandler for Server {
                         "error": { "kind": error.kind(), "message": error.to_string() }
                     }))
                     .into())
-                }
-                Err(error @ ExecuteError::Task(_)) => {
-                    tracing::error!(%error, "execute failed");
-                    Err(ErrorData::internal_error(error.to_string(), None))
                 }
             },
             name => Err(ErrorData::invalid_params(

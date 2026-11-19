@@ -29,6 +29,7 @@
             ];
           };
           cargoLock.lockFile = ./Cargo.lock;
+          nativeCheckInputs = [ pkgs.cacert ];
           meta.mainProgram = "sistem-jedan";
         };
       });

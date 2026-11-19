@@ -18,14 +18,15 @@ const MAX_NESTING_DEPTH: usize = 64;
 const REDACTED: &str = "<redacted>";
 
 /// A Decisions API request: the `state` to judge and the named questions to answer about it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub state: serde_json::Value,
     pub questions: BTreeMap<String, Question>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Question {
     /// Yes/no question answered with the probability of `true`.
     Noul {
@@ -48,7 +49,8 @@ pub enum Question {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoulCriteria {
     #[serde(rename = "true")]
     pub yes: String,
@@ -56,7 +58,7 @@ pub struct NoulCriteria {
     pub no: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub id: Option<String>,
     /// The exact model build that answered.
@@ -66,7 +68,7 @@ pub struct Response {
     pub usage: Usage,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
     Noul(NoulAnswer),
@@ -76,14 +78,14 @@ pub enum Answer {
     Refusal,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoulAnswer {
     /// Probability of `true`, from 0 to 1.
     pub noul: f64,
     pub confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceAnswer {
     /// The winning choice name.
     pub choice: String,
@@ -91,7 +93,7 @@ pub struct ChoiceAnswer {
     pub confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoreAnswer {
     /// Probability-weighted position on the 0-indexed scale, from 0 to the number of levels minus 1.
     pub score: f64,
@@ -102,7 +104,7 @@ pub struct ScoreAnswer {
     pub confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -113,12 +115,12 @@ pub struct Usage {
     pub is_byok: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostDetails {
     #[serde(rename = "upstream_inference_cost")]
     pub upstream: Option<f64>,
@@ -204,6 +206,23 @@ pub enum DecisionsError {
     Decode(#[source] serde_json::Error),
     #[error("invalid response: {0}")]
     InvalidResponse(#[from] ResponseError),
+}
+
+impl DecisionsError {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Build(_) | Self::InvalidApiKey => "configuration",
+            Self::InvalidRequest(_) => "invalid_input",
+            Self::Timeout(_) => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Authentication { .. } => "authentication",
+            Self::Http { .. } => "http",
+            Self::ResponseTooLarge | Self::Decode(_) | Self::InvalidResponse(_) => {
+                "invalid_response"
+            }
+        }
+    }
 }
 
 /// Reusable Decisions API client bound to one endpoint, model and API key.
@@ -302,7 +321,7 @@ impl Client {
         if error.is_timeout() {
             DecisionsError::Timeout(self.timeout)
         } else {
-            DecisionsError::Transport(error)
+            DecisionsError::Transport(error.without_url())
         }
     }
 

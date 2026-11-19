@@ -1,13 +1,33 @@
+use std::cell::Cell;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rquickjs::{Coerced, Context, Ctx, Promise, Runtime, Value};
+use rquickjs::function::Async;
+use rquickjs::{
+    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Coerced, Ctx, Exception, Function,
+    Object, Promise, Value,
+};
+use tokio::sync::Semaphore;
+
+use crate::decisions::{self, DecisionsError, Request};
 
 pub const STACK_LIMIT: usize = 512 * 1024;
+const SYSTEM1_ERROR: &str = "System1Error";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub timeout: Duration,
     pub memory_limit: usize,
+}
+
+/// Hosted System 1 access shared by every execution: the configured client, if any, and the
+/// limiter for simultaneous inference requests.
+#[derive(Debug)]
+pub struct System1 {
+    client: Option<decisions::Client>,
+    permits: Semaphore,
+    max_calls: NonZeroU32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +50,25 @@ pub enum JsError {
     Json(#[from] serde_json::Error),
 }
 
+/// Failure of one `system1.decide()` call, delivered to JavaScript as a rejected promise.
+#[derive(Debug, thiserror::Error)]
+pub enum DecideError {
+    #[error("system1.decide() is unavailable because no [provider] is configured")]
+    ProviderNotConfigured,
+    #[error("system1.decide() may be called at most {0} times per execution")]
+    CallLimitExceeded(NonZeroU32),
+    #[error("decision input is not JSON-serializable: {0}")]
+    Unserializable(String),
+    #[error("invalid decision input: {0}")]
+    InvalidInput(#[source] serde_json::Error),
+    #[error(transparent)]
+    Decisions(#[from] DecisionsError),
+    #[error("failed to encode the decision response: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("the inference request limiter is closed")]
+    LimiterClosed,
+}
+
 impl JsError {
     #[must_use]
     pub fn kind(&self) -> &'static str {
@@ -46,40 +85,147 @@ impl JsError {
     }
 }
 
-pub fn run(code: &str, limits: Limits) -> Result<serde_json::Value, JsError> {
+impl DecideError {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ProviderNotConfigured => "provider_not_configured",
+            Self::CallLimitExceeded(_) => "call_limit_exceeded",
+            Self::Unserializable(_) | Self::InvalidInput(_) => "invalid_input",
+            Self::Decisions(error) => error.kind(),
+            Self::Encode(_) => "encode",
+            Self::LimiterClosed => "limiter_closed",
+        }
+    }
+
+    fn throw(&self, ctx: &Ctx<'_>) -> rquickjs::Error {
+        let exception = match Exception::from_message(ctx.clone(), &self.to_string()) {
+            Ok(exception) => exception,
+            Err(error) => return error,
+        };
+        let object = exception.as_object();
+        if let Err(error) = object
+            .set("name", SYSTEM1_ERROR)
+            .and_then(|()| object.set("kind", self.kind()))
+        {
+            return error;
+        }
+        ctx.throw(exception.into_value())
+    }
+}
+
+impl System1 {
+    #[must_use]
+    pub fn new(
+        client: Option<decisions::Client>,
+        max_concurrent_requests: NonZeroU32,
+        max_calls: NonZeroU32,
+    ) -> Self {
+        Self {
+            client,
+            permits: Semaphore::new(max_concurrent_requests.get() as usize),
+            max_calls,
+        }
+    }
+
+    fn prepare<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        input: Value<'js>,
+        remaining: &Cell<u32>,
+    ) -> Result<Request, DecideError> {
+        if self.client.is_none() {
+            return Err(DecideError::ProviderNotConfigured);
+        }
+        let json = match ctx.json_stringify(input).catch(ctx) {
+            Ok(Some(json)) => json
+                .to_string()
+                .map_err(|error| DecideError::Unserializable(error.to_string()))?,
+            Ok(None) => {
+                return Err(DecideError::Unserializable(
+                    "expected an object with `state` and `questions`".to_owned(),
+                ));
+            }
+            Err(error) => return Err(DecideError::Unserializable(caught_message(&error))),
+        };
+        let request: Request = serde_json::from_str(&json).map_err(DecideError::InvalidInput)?;
+        request.validate().map_err(DecisionsError::from)?;
+        let left = remaining
+            .get()
+            .checked_sub(1)
+            .ok_or(DecideError::CallLimitExceeded(self.max_calls))?;
+        remaining.set(left);
+        Ok(request)
+    }
+
+    async fn decide(&self, request: &Request) -> Result<String, DecideError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or(DecideError::ProviderNotConfigured)?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| DecideError::LimiterClosed)?;
+        let response = client.decide(request).await?;
+        serde_json::to_string(&response).map_err(DecideError::Encode)
+    }
+}
+
+pub async fn run(
+    code: &str,
+    limits: Limits,
+    system1: Arc<System1>,
+) -> Result<serde_json::Value, JsError> {
     let deadline = Instant::now() + limits.timeout;
-    let runtime = Runtime::new()?;
-    runtime.set_memory_limit(limits.memory_limit);
-    runtime.set_max_stack_size(STACK_LIMIT);
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
-    let context = Context::full(&runtime)?;
+    let runtime = AsyncRuntime::new()?;
+    runtime.set_memory_limit(limits.memory_limit).await;
+    runtime.set_max_stack_size(STACK_LIMIT).await;
+    runtime
+        .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
+        .await;
+    let context = AsyncContext::full(&runtime).await?;
     let source = format!("(async () => {{\n{code}\n}})()");
-    context.with(|ctx| {
+    let execution = context.async_with(async move |ctx| {
+        install(&ctx, system1).map_err(|error| caught(&ctx, error, deadline, limits))?;
         let promise = ctx
             .eval::<Promise, _>(source)
             .map_err(|error| caught(&ctx, error, deadline, limits))?;
-        let value = settle(&ctx, &promise, deadline, limits)?;
+        let value = promise
+            .into_future::<Value>()
+            .await
+            .map_err(|error| caught(&ctx, error, deadline, limits))?;
         to_json(&ctx, value, deadline, limits)
-    })
+    });
+    match tokio::time::timeout_at(deadline.into(), execution).await {
+        Ok(result) => result,
+        Err(_) if runtime.is_job_pending().await => Err(JsError::Timeout(limits.timeout)),
+        Err(_) => Err(JsError::NeverSettled),
+    }
 }
 
-fn settle<'js>(
-    ctx: &Ctx<'js>,
-    promise: &Promise<'js>,
-    deadline: Instant,
-    limits: Limits,
-) -> Result<Value<'js>, JsError> {
-    loop {
-        if let Some(result) = promise.result::<Value>() {
-            return result.map_err(|error| caught(ctx, error, deadline, limits));
-        }
-        if Instant::now() >= deadline {
-            return Err(JsError::Timeout(limits.timeout));
-        }
-        if !ctx.execute_pending_job() {
-            return Err(JsError::NeverSettled);
-        }
-    }
+fn install<'js>(ctx: &Ctx<'js>, system1: Arc<System1>) -> rquickjs::Result<()> {
+    let remaining = Cell::new(system1.max_calls.get());
+    let decide = Function::new(
+        ctx.clone(),
+        Async(move |ctx: Ctx<'js>, input: Value<'js>| {
+            let request = system1.prepare(&ctx, input, &remaining);
+            let system1 = Arc::clone(&system1);
+            async move {
+                let request = request.map_err(|error| error.throw(&ctx))?;
+                let response = system1
+                    .decide(&request)
+                    .await
+                    .map_err(|error| error.throw(&ctx))?;
+                ctx.json_parse(response)
+            }
+        }),
+    )?
+    .with_name("decide")?;
+    let namespace = Object::new(ctx.clone())?;
+    namespace.set("decide", decide)?;
+    ctx.globals().set("system1", namespace)
 }
 
 fn to_json<'js>(
@@ -99,6 +245,16 @@ fn to_json<'js>(
             JsError::Exception(message) => Err(JsError::UnsupportedResult(message)),
             error => Err(error),
         },
+    }
+}
+
+fn caught_message(error: &CaughtError<'_>) -> String {
+    match error {
+        CaughtError::Exception(exception) => exception.message().unwrap_or_default(),
+        CaughtError::Value(value) => value
+            .get::<Coerced<String>>()
+            .map_or_else(|error| error.to_string(), |Coerced(message)| message),
+        CaughtError::Error(error) => error.to_string(),
     }
 }
 
@@ -128,5 +284,74 @@ fn caught(ctx: &Ctx<'_>, error: rquickjs::Error, deadline: Instant, limits: Limi
     match exception.stack().filter(|stack| !stack.is_empty()) {
         Some(stack) => JsError::Exception(format!("{name}: {message}\n{stack}")),
         None => JsError::Exception(format!("{name}: {message}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ApiKey, Provider};
+
+    const LIMITS: Limits = Limits {
+        timeout: Duration::from_secs(2),
+        memory_limit: 16 * 1024 * 1024,
+    };
+    const DECIDE: &str = r#"system1.decide({ state: "x", questions: { q: { type: "noul" } } })"#;
+
+    fn system1(client: Option<decisions::Client>, max_calls: u32) -> Arc<System1> {
+        Arc::new(System1::new(
+            client,
+            NonZeroU32::MIN,
+            NonZeroU32::new(max_calls).unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn plain_javascript_runs_and_decide_rejects_without_provider() {
+        let code = format!(
+            "const [a, b] = await Promise.all([1, Promise.resolve(2)]);
+             const [settled] = await Promise.allSettled([{DECIDE}]);
+             return {{ sum: a + b, name: settled.reason.name, kind: settled.reason.kind }};"
+        );
+        let result = run(&code, LIMITS, system1(None, 1)).await.unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({ "sum": 3, "name": "System1Error", "kind": "provider_not_configured" })
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_infinite_loop_times_out() {
+        let error = run("for (;;) {}", LIMITS, system1(None, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, JsError::Timeout(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn calls_beyond_the_budget_reject() {
+        let provider = Provider {
+            endpoint: "https://127.0.0.1:9/".parse().unwrap(),
+            model: "test".to_owned(),
+            api_key: ApiKey::new("secret-key"),
+        };
+        let client = decisions::Client::new(&provider, LIMITS.timeout).unwrap();
+        let code = format!(
+            "const results = await Promise.allSettled([{DECIDE}, {DECIDE}, {DECIDE}]);
+             return results.map(r => r.reason.kind + ': ' + r.reason.message);"
+        );
+        let result = run(&code, LIMITS, system1(Some(client), 2)).await.unwrap();
+        let kinds: Vec<&str> = result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(kinds.iter().all(|r| !r.contains("secret-key")), "{kinds:?}");
+        assert!(
+            kinds[..2].iter().all(|r| r.starts_with("transport")),
+            "{kinds:?}"
+        );
+        assert!(kinds[2].starts_with("call_limit_exceeded"), "{kinds:?}");
     }
 }

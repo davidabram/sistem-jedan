@@ -66,6 +66,13 @@ impl ApiKey {
     }
 }
 
+#[cfg(test)]
+impl ApiKey {
+    pub fn new(key: &str) -> Self {
+        Self(key.to_owned())
+    }
+}
+
 impl fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ApiKey(<redacted>)")
