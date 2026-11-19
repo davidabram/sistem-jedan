@@ -1,3 +1,5 @@
+![Sistem Jedan: kode mode jev your agent](assets/hero.png)
+
 # sistem jedan
 
 > **Experimental.** This project is early and unstable. The tool interface, configuration format and error kinds may change without notice, and the Decisions API it targets is itself an alpha endpoint. Don't rely on it for anything important yet.
