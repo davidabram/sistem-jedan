@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::task::JoinError;
 
-use crate::js::{self, JsError};
+use crate::js::{self, JsError, Limits};
 
 pub const EXECUTE: &str = "execute";
 
@@ -36,14 +36,25 @@ pub enum ExecuteError {
     Task(#[from] JoinError),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Server;
+#[derive(Debug, Clone, Copy)]
+pub struct Server {
+    limits: Limits,
+}
 
 impl Server {
-    fn execute_tool() -> Tool {
+    #[must_use]
+    pub fn new(limits: Limits) -> Self {
+        Self { limits }
+    }
+
+    fn execute_tool(self) -> Tool {
         Tool::new(
             EXECUTE,
-            "Runs JavaScript in an isolated QuickJS sandbox. `code` is the body of an async function: use `await` freely and `return` a JSON-serializable value, which is returned as `result`. There is no filesystem, network, environment, or module access; each call gets a fresh context with a 5 s deadline and a 64 MiB memory limit. Failures return `{\"error\": {\"kind\", \"message\"}}` with `isError: true`.",
+            format!(
+                "Runs JavaScript in an isolated QuickJS sandbox. `code` is the body of an async function: use `await` freely and `return` a JSON-serializable value, which is returned as `result`. There is no filesystem, network, environment, or module access; each call gets a fresh context with a {} s deadline and a {} MiB memory limit. Failures return `{{\"error\": {{\"kind\", \"message\"}}}}` with `isError: true`.",
+                self.limits.timeout.as_secs(),
+                self.limits.memory_limit / (1024 * 1024),
+            ),
             rmcp::model::JsonObject::new(),
         )
         .with_input_schema::<ExecuteArgs>()
@@ -51,13 +62,15 @@ impl Server {
     }
 
     async fn execute(
+        self,
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult, ExecuteError> {
         let arguments = serde_json::Value::Object(arguments.unwrap_or_default());
         let args: ExecuteArgs =
             serde_json::from_value(arguments).map_err(ExecuteError::InvalidArguments)?;
         tracing::info!(code_bytes = args.code.len(), "executing JavaScript");
-        let result = tokio::task::spawn_blocking(move || js::run(&args.code)).await??;
+        let result =
+            tokio::task::spawn_blocking(move || js::run(&args.code, self.limits)).await??;
         Ok(CallToolResult::structured(json!(ExecuteOutput { result })))
     }
 }
@@ -71,7 +84,7 @@ impl ServerHandler for Server {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match name {
-            EXECUTE => Some(Self::execute_tool()),
+            EXECUTE => Some(self.execute_tool()),
             _ => None,
         }
     }
@@ -81,7 +94,7 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![Self::execute_tool()]))
+        Ok(ListToolsResult::with_all_items(vec![self.execute_tool()]))
     }
 
     async fn call_tool(
@@ -90,7 +103,7 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         match request.name.as_ref() {
-            EXECUTE => match Self::execute(request.arguments).await {
+            EXECUTE => match self.execute(request.arguments).await {
                 Ok(result) => Ok(result.into()),
                 Err(error @ ExecuteError::InvalidArguments(_)) => {
                     tracing::warn!(%error, "rejected execute call");

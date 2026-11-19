@@ -1,3 +1,4 @@
+mod config;
 mod js;
 mod mcp;
 
@@ -11,6 +12,8 @@ use tokio::task::JoinError;
 )]
 #[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("configuration error: {0}")]
+    Config(#[from] config::ConfigError),
     #[error("MCP initialization failed: {0}")]
     Initialize(#[from] ServerInitializeError),
     #[error("MCP session task failed: {0}")]
@@ -29,7 +32,30 @@ async fn main() -> Result<(), Error> {
         .init();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting sistem-jedan");
-    let service = mcp::Server.serve(rmcp::transport::stdio()).await?;
+    let config = config::load(std::env::args_os().skip(1))
+        .inspect_err(|error| tracing::error!(%error, "invalid configuration"))?;
+    if let Some(file) = &config.file {
+        tracing::info!(
+            path = %file.path.display(),
+            endpoint = file.provider.endpoint,
+            model = file.provider.model,
+            credentials = %file.provider.credential_source,
+            "loaded configuration"
+        );
+    } else {
+        tracing::info!("no configuration found; using default execution limits");
+    }
+    let execution = config.execution;
+    tracing::info!(
+        timeout_seconds = execution.limits.timeout.as_secs(),
+        memory_limit_bytes = execution.limits.memory_limit,
+        max_concurrent_requests = execution.max_concurrent_requests,
+        max_calls_per_execution = execution.max_calls_per_execution,
+        "execution limits"
+    );
+    let service = mcp::Server::new(execution.limits)
+        .serve(rmcp::transport::stdio())
+        .await?;
     match service.waiting().await? {
         QuitReason::Closed => tracing::info!("client disconnected"),
         QuitReason::Cancelled => tracing::info!("session cancelled"),
