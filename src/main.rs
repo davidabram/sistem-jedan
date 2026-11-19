@@ -1,3 +1,4 @@
+mod js;
 mod mcp;
 
 use rmcp::ServiceExt;

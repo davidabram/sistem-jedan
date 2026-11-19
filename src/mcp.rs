@@ -8,6 +8,10 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::task::JoinError;
+
+use crate::js::{self, JsError};
 
 pub const EXECUTE: &str = "execute";
 
@@ -19,21 +23,17 @@ pub struct ExecuteArgs {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ExecuteOutput {
-    pub status: ExecuteStatus,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecuteStatus {
-    NotImplemented,
+    pub result: serde_json::Value,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecuteError {
     #[error("invalid arguments: {0}")]
     InvalidArguments(#[source] serde_json::Error),
-    #[error("failed to serialize output: {0}")]
-    Output(#[source] serde_json::Error),
+    #[error(transparent)]
+    Js(#[from] JsError),
+    #[error("execution task failed: {0}")]
+    Task(#[from] JoinError),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,26 +43,22 @@ impl Server {
     fn execute_tool() -> Tool {
         Tool::new(
             EXECUTE,
-            "Accepts JavaScript source code. Execution is not implemented yet: the code is never run and the result is always {\"status\": \"not_implemented\"}.",
+            "Runs JavaScript in an isolated QuickJS sandbox. `code` is the body of an async function: use `await` freely and `return` a JSON-serializable value, which is returned as `result`. There is no filesystem, network, environment, or module access; each call gets a fresh context with a 5 s deadline and a 64 MiB memory limit. Failures return `{\"error\": {\"kind\", \"message\"}}` with `isError: true`.",
             rmcp::model::JsonObject::new(),
         )
         .with_input_schema::<ExecuteArgs>()
         .with_output_schema::<ExecuteOutput>()
     }
 
-    fn execute(arguments: Option<rmcp::model::JsonObject>) -> Result<CallToolResult, ExecuteError> {
+    async fn execute(
+        arguments: Option<rmcp::model::JsonObject>,
+    ) -> Result<CallToolResult, ExecuteError> {
         let arguments = serde_json::Value::Object(arguments.unwrap_or_default());
         let args: ExecuteArgs =
             serde_json::from_value(arguments).map_err(ExecuteError::InvalidArguments)?;
-        tracing::info!(
-            code_bytes = args.code.len(),
-            "execute called; code not evaluated"
-        );
-        let output = ExecuteOutput {
-            status: ExecuteStatus::NotImplemented,
-        };
-        let value = serde_json::to_value(&output).map_err(ExecuteError::Output)?;
-        Ok(CallToolResult::structured(value))
+        tracing::info!(code_bytes = args.code.len(), "executing JavaScript");
+        let result = tokio::task::spawn_blocking(move || js::run(&args.code)).await??;
+        Ok(CallToolResult::structured(json!(ExecuteOutput { result })))
     }
 }
 
@@ -94,13 +90,20 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         match request.name.as_ref() {
-            EXECUTE => match Self::execute(request.arguments) {
+            EXECUTE => match Self::execute(request.arguments).await {
                 Ok(result) => Ok(result.into()),
                 Err(error @ ExecuteError::InvalidArguments(_)) => {
                     tracing::warn!(%error, "rejected execute call");
                     Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into())
                 }
-                Err(error @ ExecuteError::Output(_)) => {
+                Err(ExecuteError::Js(error)) => {
+                    tracing::info!(kind = error.kind(), %error, "JavaScript execution failed");
+                    Ok(CallToolResult::structured_error(json!({
+                        "error": { "kind": error.kind(), "message": error.to_string() }
+                    }))
+                    .into())
+                }
+                Err(error @ ExecuteError::Task(_)) => {
                     tracing::error!(%error, "execute failed");
                     Err(ErrorData::internal_error(error.to_string(), None))
                 }

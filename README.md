@@ -2,13 +2,20 @@
 
 Minimal MCP server over stdio, built on the official `rmcp` Rust SDK.
 
-It exposes exactly one tool, `execute`, taking `{ "code": string }`. JavaScript evaluation is not implemented: the code is never run and every valid call returns:
+It exposes exactly one tool, `execute`, taking `{ "code": string }`. The code runs in a sandboxed [QuickJS](https://bellard.org/quickjs/) engine (via `rquickjs`) as the body of an async function, so `await` works at the top level and the result is whatever the code explicitly `return`s:
 
-```json
-{ "status": "not_implemented" }
+```js
+const values = await Promise.all([Promise.resolve(10), Promise.resolve(20)]);
+return { sum: values.reduce((a, b) => a + b, 0) };
 ```
 
-Invalid arguments produce a tool error (`isError: true`); unknown tool names produce a JSON-RPC `-32602` error.
+```json
+{ "result": { "sum": 30 } }
+```
+
+Each call gets a fresh runtime and context with no filesystem, network, environment, timers, or module access. Execution is limited to 5 seconds (enforced with the QuickJS interrupt handler, so synchronous infinite loops are stopped) and 64 MiB of memory.
+
+Failures return a tool error (`isError: true`) with structured content `{ "error": { "kind", "message" } }`, where `kind` is one of `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `engine`, or `json`. Invalid arguments produce a plain tool error; unknown tool names produce a JSON-RPC `-32602` error.
 
 Stdout carries MCP messages only; diagnostics are logged to stderr. The process exits when the client closes stdin.
 
