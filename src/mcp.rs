@@ -97,10 +97,10 @@ impl Server {
 - `score`: criteria list at least {MIN_SCORE_LEVELS} descriptions in ascending order. Answer has `score`, the probability-weighted level from 0 to criteria.length − 1 and often fractional (round it or take the most probable level for one level), optional `probabilities` and `legend` with canonical decimal keys such as "0".
 - Each question takes optional `instructions`. Answers may include `confidence`. Always check `answer.type` for `refusal` before reading type-specific fields.
 
-The decision resolves to `{{id, model, provider, answers, usage}}`, with answers keyed by question name. Example:
+The decision resolves to `{{id, model, provider, answers, usage}}`, with answers keyed by question name. `id`, `provider`, `confidence` and the `usage` cost fields may be `null`. Example:
 `const d = await system1.decide({{state: "Checkout fails in Safari", questions: {{bug: {{type: "noul", instructions: "Is this a bug?"}}}}}}); const a = d.answers.bug; return a.type === "noul" ? a.noul : null;`
 
-A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Invalid input spends no calls. Run independent decisions with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
+A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Invalid input spends no calls. Clients may run tool calls one at a time, so run independent decisions inside one script with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
 
 Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocations, {calls} decision calls, {MAX_DECISION_INPUT_MIB} MiB of JSON per decision input and {MAX_EXECUTE_RESULT_MIB} MiB of JSON for the result. At most {executions} executions and {requests} inference requests run concurrently. Inference waits count toward the deadline.
 

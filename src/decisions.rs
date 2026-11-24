@@ -141,6 +141,8 @@ pub(super) enum RequestError {
     TooFewLevels(String),
     #[error("question {0:?} has empty instructions")]
     EmptyInstructions(String),
+    #[error("noul question {0:?} needs instructions or criteria")]
+    NoulWithoutGuidance(String),
     #[error("question {question:?} has an empty description for criterion {criterion:?}")]
     EmptyCriterion { question: String, criterion: String },
 }
@@ -230,8 +232,26 @@ struct Body<'a> {
 }
 
 #[derive(Deserialize)]
-struct ErrorBody {
-    error: ErrorDetail,
+#[serde(untagged)]
+enum ErrorBody {
+    Error { error: ErrorDetail },
+    Detail { detail: serde_json::Value },
+}
+
+impl ErrorBody {
+    fn into_message(self) -> String {
+        match self {
+            Self::Error { error } => error.message,
+            Self::Detail { detail } => match detail {
+                serde_json::Value::String(message) => message,
+                serde_json::Value::Object(ref fields) => fields
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| detail.to_string(), str::to_owned),
+                detail => detail.to_string(),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -323,7 +343,7 @@ impl Client {
                     .unwrap_or("unknown error")
                     .to_owned()
             },
-            |body| self.redact(&body.error.message),
+            |body| self.redact(&body.into_message()),
         );
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -412,16 +432,17 @@ impl Question {
             criterion: diagnostic::truncate(criterion, MAX_ERROR_LABEL_BYTES),
         };
         match self {
-            Self::Noul { criteria, .. } => {
-                if let Some(criteria) = criteria {
-                    if is_blank(&criteria.yes) {
-                        return Err(empty("true"));
-                    }
-                    if is_blank(&criteria.no) {
-                        return Err(empty("false"));
-                    }
+            Self::Noul {
+                instructions,
+                criteria,
+            } => match criteria {
+                None if instructions.is_none() => {
+                    return Err(RequestError::NoulWithoutGuidance(name.to_owned()));
                 }
-            }
+                Some(criteria) if is_blank(&criteria.yes) => return Err(empty("true")),
+                Some(criteria) if is_blank(&criteria.no) => return Err(empty("false")),
+                _ => {}
+            },
             Self::Choice { criteria, .. } => {
                 if criteria.len() < MIN_CHOICES {
                     return Err(RequestError::TooFewChoices(name.to_owned()));

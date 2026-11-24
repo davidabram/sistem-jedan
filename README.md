@@ -194,6 +194,8 @@ Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no file
 
 The memory limit counts live QuickJS backing allocations, including runtime initialization, arenas and allocator headers. It excludes global allocator overhead, any temporary space used internally by the global allocator during reallocation, and separate allocations made by Rust, the transport or the HTTP client. Calls count toward the budget once their input passes validation, even if they fail later.
 
+Some MCP clients, including Claude Code, run tool calls one at a time, so a single agent rarely reaches `max_concurrent_executions`. Put independent decisions in one script with `Promise.all` to use `max_concurrent_requests`.
+
 ## Errors
 
 An execution ends when the returned promise settles, the deadline expires, the runtime runs out of memory, or MCP cancels the request. Every deadline expiration is `timeout`, including when the returned promise stays pending. A backing allocation failure ends the execution even if JavaScript catches the resulting exception. Execution diagnostics are limited to 8 KiB of UTF-8.
