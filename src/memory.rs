@@ -133,3 +133,14 @@ unsafe impl Allocator for LimitedAllocator {
         })
     }
 }
+
+/// Returns memory freed by a finished execution to the OS. glibc otherwise
+/// keeps it cached in per-thread arenas, holding up to roughly one
+/// execution's worth of RSS per thread that ran one.
+pub(super) fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointers and is safe to call at any time.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}

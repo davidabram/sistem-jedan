@@ -11,6 +11,7 @@ use rquickjs::{
 use tokio::sync::Semaphore;
 
 use crate::config::BYTES_PER_MIB;
+use crate::cpu::Throttle;
 use crate::decisions::{self, DecisionsError, RequestError, ValidatedRequest};
 use crate::diagnostic;
 use crate::memory::LimitedAllocator;
@@ -29,6 +30,7 @@ pub(super) const MAX_EXECUTE_RESULT_BYTES: usize = BYTES_PER_MIB;
 pub(super) struct Limits {
     pub(super) timeout: Duration,
     pub(super) memory_limit: NonZeroUsize,
+    pub(super) vcpu_per_execution: Option<f64>,
 }
 
 pub(super) struct System1 {
@@ -259,8 +261,12 @@ pub(super) async fn run(
         .map_err(|error| execution.classify(error, None, None))?;
     runtime.set_max_stack_size(STACK_LIMIT).await;
     let interrupt = execution.clone();
+    let mut throttle = limits.vcpu_per_execution.map(Throttle::new);
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
+            if let Some(throttle) = &mut throttle {
+                throttle.pace(deadline);
+            }
             cancelled() || interrupt.failure().is_some()
         })))
         .await;

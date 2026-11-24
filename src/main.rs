@@ -1,4 +1,5 @@
 mod config;
+mod cpu;
 mod decisions;
 mod diagnostic;
 mod js;
@@ -61,6 +62,7 @@ async fn serve() -> Result<(), Error> {
     tracing::info!(
         timeout_seconds = execution.limits.timeout.as_secs(),
         memory_limit_bytes = execution.limits.memory_limit.get(),
+        vcpu_per_execution = ?execution.limits.vcpu_per_execution,
         max_concurrent_requests = execution.max_concurrent_requests,
         max_concurrent_executions = execution.max_concurrent_executions,
         max_calls_per_execution = execution.max_calls_per_execution,

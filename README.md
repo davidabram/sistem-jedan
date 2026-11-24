@@ -168,6 +168,7 @@ api_key = "<your OpenRouter API key>"
 [execution]                    # optional; defaults shown
 timeout_seconds = 5            # whole execution, including HTTP (1–3600)
 memory_limit_mb = 64           # QuickJS backing allocations
+# vcpu_per_execution = 0.2      # CPU share per execution (0–1]; unset = no cap
 max_concurrent_requests = 8    # in-flight inference requests, shared across executions
 max_concurrent_executions = 4   # live QuickJS runtimes, shared across the server
 max_calls_per_execution = 32   # decide() calls per execute
@@ -185,6 +186,7 @@ Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no file
 | --- | --- |
 | `timeout_seconds` | `timeout` (also stops infinite loops) |
 | `memory_limit_mb` | `out_of_memory` |
+| `vcpu_per_execution` | CPU-bound code is paused to stay under the share; it gets less done before `timeout` |
 | `max_concurrent_executions` | `execution_capacity` immediately, before runtime creation |
 | `max_concurrent_requests` | extra calls queue, and the wait counts toward the deadline |
 | `max_calls_per_execution` | `call_limit_exceeded` |
@@ -193,6 +195,8 @@ Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no file
 | 1 MiB of serialized UTF-8 JSON in the returned result (fixed) | `result_too_large` (filter or aggregate in JavaScript before returning) |
 
 The memory limit counts live QuickJS backing allocations, including runtime initialization, arenas and allocator headers. It excludes global allocator overhead, any temporary space used internally by the global allocator during reallocation, and separate allocations made by Rust, the transport or the HTTP client. Calls count toward the budget once their input passes validation, even if they fail later.
+
+Each execution runs on its own thread, so CPU-bound scripts don't delay MCP requests or inference responses. With `vcpu_per_execution`, the server measures each execution's thread CPU time and pauses it whenever it gets ahead of its share, so busy scripts use at most `max_concurrent_executions` × `vcpu_per_execution` CPUs in total. Time spent waiting on `system1.decide()` earns at most 10 ms of extra CPU, and a single native call, such as filling a large typed array, is only paused after it returns. To size a container, give it that much CPU plus some headroom for the server, and at least 60 MB + `max_concurrent_executions` × `memory_limit_mb` of memory.
 
 Some MCP clients, including Claude Code, run tool calls one at a time, so a single agent rarely reaches `max_concurrent_executions`. Put independent decisions in one script with `Promise.all` to use `max_concurrent_requests`.
 

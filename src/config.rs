@@ -57,6 +57,8 @@ pub(super) enum ConfigError {
         Semaphore::MAX_PERMITS
     )]
     InvalidMaxConcurrentExecutions,
+    #[error("execution.vcpu_per_execution must be greater than 0 and at most 1")]
+    InvalidVcpuPerExecution,
     #[error("execution.max_calls_per_execution must be at least 1")]
     InvalidMaxCallsPerExecution,
 }
@@ -85,6 +87,7 @@ impl ExecutionSettings {
         limits: Limits {
             timeout: Duration::from_secs(5),
             memory_limit: NonZeroUsize::new(64 * BYTES_PER_MIB).unwrap(),
+            vcpu_per_execution: None,
         },
         max_concurrent_requests: 8,
         max_concurrent_executions: 4,
@@ -123,6 +126,7 @@ struct RawProvider {
 struct RawExecution {
     timeout_seconds: u64,
     memory_limit_mb: usize,
+    vcpu_per_execution: Option<f64>,
     max_concurrent_requests: usize,
     max_concurrent_executions: usize,
     max_calls_per_execution: u32,
@@ -134,6 +138,7 @@ impl Default for RawExecution {
         Self {
             timeout_seconds: settings.limits.timeout.as_secs(),
             memory_limit_mb: settings.limits.memory_limit.get() / BYTES_PER_MIB,
+            vcpu_per_execution: settings.limits.vcpu_per_execution,
             max_concurrent_requests: settings.max_concurrent_requests,
             max_concurrent_executions: settings.max_concurrent_executions,
             max_calls_per_execution: settings.max_calls_per_execution.get(),
@@ -151,6 +156,12 @@ impl RawExecution {
             .checked_mul(BYTES_PER_MIB)
             .and_then(NonZeroUsize::new)
             .ok_or(ConfigError::InvalidMemoryLimit)?;
+        if self
+            .vcpu_per_execution
+            .is_some_and(|share| !(share > 0.0 && share <= 1.0))
+        {
+            return Err(ConfigError::InvalidVcpuPerExecution);
+        }
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_requests) {
             return Err(ConfigError::InvalidMaxConcurrentRequests);
         }
@@ -161,6 +172,7 @@ impl RawExecution {
             limits: Limits {
                 timeout: Duration::from_secs(self.timeout_seconds),
                 memory_limit,
+                vcpu_per_execution: self.vcpu_per_execution,
             },
             max_concurrent_requests: self.max_concurrent_requests,
             max_concurrent_executions: self.max_concurrent_executions,

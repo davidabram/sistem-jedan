@@ -22,6 +22,7 @@ use crate::js::{
     self, CALL_LIMIT_KIND, INVALID_INPUT_KIND, JsError, OUT_OF_MEMORY_KIND,
     PROVIDER_NOT_CONFIGURED_KIND, SYSTEM1_ERROR, System1, TIMEOUT_KIND,
 };
+use crate::memory;
 
 const EXECUTE: &str = "execute";
 const MAX_SOURCE_BYTES: usize = BYTES_PER_MIB;
@@ -48,6 +49,8 @@ enum ExecuteError {
     SourceTooLarge,
     #[error("all execution slots are busy")]
     AtCapacity,
+    #[error("execution thread failed: {0}")]
+    Thread(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Js(#[from] JsError),
 }
@@ -57,6 +60,7 @@ impl ExecuteError {
         match self {
             Self::InvalidArguments | Self::SourceTooLarge => "invalid_arguments",
             Self::AtCapacity => "execution_capacity",
+            Self::Thread(_) => "engine",
             Self::Js(error) => error.kind(),
         }
     }
@@ -65,7 +69,7 @@ impl ExecuteError {
 pub(super) struct Server {
     settings: ExecutionSettings,
     system1: Arc<System1>,
-    executions: Semaphore,
+    executions: Arc<Semaphore>,
 }
 
 impl Server {
@@ -76,7 +80,7 @@ impl Server {
             settings.max_calls_per_execution,
         );
         Self {
-            executions: Semaphore::new(settings.max_concurrent_executions),
+            executions: Arc::new(Semaphore::new(settings.max_concurrent_executions)),
             system1: Arc::new(system1),
             settings,
         }
@@ -102,11 +106,15 @@ The decision resolves to `{{id, model, provider, answers, usage}}`, with answers
 
 A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Invalid input spends no calls. Clients may run tool calls one at a time, so run independent decisions inside one script with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
 
-Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocations, {calls} decision calls, {MAX_DECISION_INPUT_MIB} MiB of JSON per decision input and {MAX_EXECUTE_RESULT_MIB} MiB of JSON for the result. At most {executions} executions and {requests} inference requests run concurrently. Inference waits count toward the deadline.
+Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocations, {cpu}{calls} decision calls, {MAX_DECISION_INPUT_MIB} MiB of JSON per decision input and {MAX_EXECUTE_RESULT_MIB} MiB of JSON for the result. At most {executions} executions and {requests} inference requests run concurrently. Inference waits count toward the deadline.
 
 Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true`. Excess executions fail immediately with `{capacity}`. Pending promises and running code both fail with `{TIMEOUT_KIND}` on deadline expiry. Allocator exhaustion fails with `{OUT_OF_MEMORY_KIND}`. Use an explicit return to avoid `{missing}` and filter or aggregate results to avoid `{too_large}`."#,
                 timeout = settings.limits.timeout.as_secs(),
                 memory = settings.limits.memory_limit.get() / BYTES_PER_MIB,
+                cpu = settings
+                    .limits
+                    .vcpu_per_execution
+                    .map_or_default(|share| format!("{share} vCPU (CPU-bound code is paused to stay under it), ")),
                 calls = settings.max_calls_per_execution,
                 executions = settings.max_concurrent_executions,
                 requests = settings.max_concurrent_requests,
@@ -134,18 +142,25 @@ Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true
         if code.len() > MAX_SOURCE_BYTES {
             return Err(ExecuteError::SourceTooLarge);
         }
-        let _permit = self
-            .executions
-            .try_acquire()
+        let permit = Arc::clone(&self.executions)
+            .try_acquire_owned()
             .map_err(|_| ExecuteError::AtCapacity)?;
         tracing::info!(code_bytes = code.len(), "executing JavaScript");
-        let result = js::run(
-            code,
-            self.settings.limits,
-            Arc::clone(&self.system1),
-            cancelled,
-        )
-        .await?;
+        // A dedicated thread keeps CPU-bound scripts off the async workers and
+        // lets the CPU throttle measure one thread for the whole execution.
+        // The permit moves with it so a cancelled call keeps its slot until
+        // the script has actually stopped.
+        let code = code.to_owned();
+        let limits = self.settings.limits;
+        let system1 = Arc::clone(&self.system1);
+        let runtime = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = runtime.block_on(js::run(&code, limits, system1, cancelled));
+            memory::release_free_memory();
+            result
+        })
+        .await??;
         Ok(CallToolResult::structured(json!(ExecuteOutput { result })))
     }
 }
