@@ -155,7 +155,7 @@ Score probability and legend keys use canonical decimal levels such as `"0"` and
 
 The server looks for config in this order:
 
-1. `--config <path>`, which must exist. This is the only CLI option.
+1. `--config <path>`, which must exist.
 2. `$XDG_CONFIG_HOME/sistem-jedan/config.toml`, falling back to `~/.config/sistem-jedan/config.toml`.
 3. If neither exists, the server starts without a provider and `system1.decide()` rejects with `provider_not_configured`.
 
@@ -177,6 +177,25 @@ max_calls_per_execution = 32   # decide() calls per execute
 Unknown keys are rejected. An invalid config is logged to stderr, and the server exits. If your scripts chain several decisions, raise `timeout_seconds`.
 
 **Keep the file at mode `600` and never commit it.** The key is never logged, returned to the agent or exposed to JavaScript.
+
+## Running over HTTP
+
+By default the server speaks MCP over stdio. Pass `--http <address>` to serve [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) at `/mcp` instead:
+
+```sh
+sistem-jedan --http 127.0.0.1:8080
+claude mcp add --scope user --transport http sistem-jedan http://127.0.0.1:8080/mcp
+```
+
+The server accepts only `Host` headers of `localhost`, `127.0.0.1` and `::1`, which blocks DNS rebinding. To reach it under another name, bind a public address and allow each hostname clients use with `--allowed-host` (repeatable; add `name:port` to allow only that port):
+
+```sh
+sistem-jedan --http 0.0.0.0:8080 --allowed-host mcp.example.com
+```
+
+Other requests get `403 Forbidden`. Every HTTP session shares one set of execution and request limits. SIGINT or SIGTERM closes open sessions and stops the server.
+
+> **There is no authentication.** Anyone who can reach the port can run scripts and spend your OpenRouter credit. Keep it on loopback or a private network, or put it behind a reverse proxy that authenticates and terminates TLS.
 
 ## Limits and sandbox
 
@@ -260,4 +279,4 @@ nix flake check    # builds the package and runs its cargo tests
 nix fmt flake.nix
 ```
 
-MCP traffic goes over stdio, logs go to stderr, and the server exits when stdin closes.
+MCP traffic goes over stdio, logs go to stderr, and the server exits when stdin closes. With `--http`, it runs until it gets SIGINT or SIGTERM.

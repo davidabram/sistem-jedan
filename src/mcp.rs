@@ -66,6 +66,7 @@ impl ExecuteError {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Server {
     settings: ExecutionSettings,
     system1: Arc<System1>,

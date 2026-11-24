@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io;
+use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,10 +18,14 @@ pub(super) const BYTES_PER_MIB: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ConfigError {
-    #[error("missing value for --config")]
-    MissingConfigValue,
-    #[error("--config given more than once")]
-    DuplicateConfig,
+    #[error("missing value for {0}")]
+    MissingValue(&'static str),
+    #[error("{0} given more than once")]
+    Duplicate(&'static str),
+    #[error("--http must be a socket address such as 127.0.0.1:8080")]
+    InvalidHttpAddress,
+    #[error("--allowed-host requires --http")]
+    AllowedHostWithoutHttp,
     #[error("unexpected argument: {}", .0.to_string_lossy())]
     UnexpectedArgument(OsString),
     #[error("failed to read {}: {source}", .path.display())]
@@ -75,6 +80,7 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ExecutionSettings {
     pub(super) limits: Limits,
     pub(super) max_concurrent_requests: usize,
@@ -100,9 +106,18 @@ pub(super) struct ConfigFile {
     pub(super) provider: Provider,
 }
 
+pub(super) enum Transport {
+    Stdio,
+    Http {
+        address: SocketAddr,
+        allowed_hosts: Vec<String>,
+    },
+}
+
 pub(super) struct Config {
     pub(super) file: Option<ConfigFile>,
     pub(super) execution: ExecutionSettings,
+    pub(super) transport: Transport,
 }
 
 #[derive(Deserialize)]
@@ -221,50 +236,84 @@ fn parse_endpoint(endpoint: &str) -> Option<Url> {
 }
 
 pub(super) fn load(args: impl IntoIterator<Item = OsString>) -> Result<Config, ConfigError> {
-    match parse_args(args)? {
+    let args = parse_args(args)?;
+    let (file, execution) = match args.config {
         Some(path) => match read(&path)? {
-            Some(source) => parse(path, &source),
-            None => Err(ConfigError::Read {
-                path,
-                source: io::ErrorKind::NotFound.into(),
-            }),
+            Some(source) => parse(path, &source)?,
+            None => {
+                return Err(ConfigError::Read {
+                    path,
+                    source: io::ErrorKind::NotFound.into(),
+                });
+            }
         },
         None => match default_path() {
             Some(path) => match read(&path)? {
-                Some(source) => parse(path, &source),
-                None => Ok(defaults()),
+                Some(source) => parse(path, &source)?,
+                None => (None, ExecutionSettings::DEFAULT),
             },
-            None => Ok(defaults()),
+            None => (None, ExecutionSettings::DEFAULT),
         },
-    }
+    };
+    Ok(Config {
+        file,
+        execution,
+        transport: args.transport,
+    })
 }
 
-fn defaults() -> Config {
-    Config {
-        file: None,
-        execution: ExecutionSettings::DEFAULT,
-    }
+struct Args {
+    config: Option<PathBuf>,
+    transport: Transport,
 }
 
-fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, ConfigError> {
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, ConfigError> {
+    const FLAGS: [&str; 3] = ["--config", "--http", "--allowed-host"];
     let mut args = args.into_iter();
-    let mut path = None;
+    let mut config = None;
+    let mut http = None;
+    let mut allowed_hosts = Vec::new();
     while let Some(arg) = args.next() {
-        let value = if arg == "--config" {
-            args.next().ok_or(ConfigError::MissingConfigValue)?
-        } else if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--config=")) {
-            OsString::from(value)
-        } else {
+        let text = arg.to_str().unwrap_or_default();
+        let (name, inline) = text.split_once('=').unwrap_or((text, ""));
+        let Some(flag) = FLAGS.into_iter().find(|flag| *flag == name) else {
             return Err(ConfigError::UnexpectedArgument(arg));
         };
+        let value = if text.contains('=') {
+            OsString::from(inline)
+        } else {
+            args.next().ok_or(ConfigError::MissingValue(flag))?
+        };
         if value.is_empty() {
-            return Err(ConfigError::MissingConfigValue);
+            return Err(ConfigError::MissingValue(flag));
         }
-        if path.replace(PathBuf::from(value)).is_some() {
-            return Err(ConfigError::DuplicateConfig);
+        match flag {
+            "--config" => {
+                if config.replace(PathBuf::from(value)).is_some() {
+                    return Err(ConfigError::Duplicate(flag));
+                }
+            }
+            "--http" => {
+                let address = value
+                    .to_str()
+                    .and_then(|value| value.parse::<SocketAddr>().ok())
+                    .ok_or(ConfigError::InvalidHttpAddress)?;
+                if http.replace(address).is_some() {
+                    return Err(ConfigError::Duplicate(flag));
+                }
+            }
+            _ => allowed_hosts.push(value.to_string_lossy().into_owned()),
         }
     }
-    Ok(path)
+    let transport = match http {
+        Some(address) => Transport::Http {
+            address,
+            allowed_hosts,
+        },
+        None if allowed_hosts.is_empty() => Transport::Stdio,
+        None => return Err(ConfigError::AllowedHostWithoutHttp),
+    };
+    Ok(Args { config, transport })
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -291,7 +340,10 @@ fn read(path: &Path) -> Result<Option<String>, ConfigError> {
     }
 }
 
-fn parse(path: PathBuf, source: &str) -> Result<Config, ConfigError> {
+fn parse(
+    path: PathBuf,
+    source: &str,
+) -> Result<(Option<ConfigFile>, ExecutionSettings), ConfigError> {
     let raw: RawConfig = toml::from_str(source).map_err(|error| ConfigError::Parse {
         line: error
             .span()
@@ -299,11 +351,11 @@ fn parse(path: PathBuf, source: &str) -> Result<Config, ConfigError> {
         message: error.message().to_owned(),
         path: path.clone(),
     })?;
-    Ok(Config {
-        file: Some(ConfigFile {
+    Ok((
+        Some(ConfigFile {
             path,
             provider: raw.provider.validate()?,
         }),
-        execution: raw.execution.validate()?,
-    })
+        raw.execution.validate()?,
+    ))
 }
