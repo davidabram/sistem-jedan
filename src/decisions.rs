@@ -10,7 +10,9 @@ use crate::config::Provider;
 use crate::diagnostic;
 
 pub(super) const MAX_QUESTION_NAME_LEN: usize = 64;
-const PROBABILITY_TOLERANCE: f64 = 0.02;
+const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
+const CHOICE_TOLERANCE: f64 = 1e-9;
+const SCORE_TOLERANCE: f64 = 0.01;
 const MAX_ERROR_LABEL_BYTES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(super) const MIN_CHOICES: usize = 2;
@@ -524,7 +526,7 @@ fn validate_choice(
             .unwrap_or((1.0 - sum).max(0.0));
         if probabilities
             .values()
-            .any(|&probability| probability - chosen > PROBABILITY_TOLERANCE)
+            .any(|&probability| probability - chosen > CHOICE_TOLERANCE)
         {
             return Err(ResponseError::InconsistentChoice {
                 question: name.to_owned(),
@@ -545,35 +547,23 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         });
     }
     confidence(name, answer.confidence)?;
-    let mut keys = answer
-        .probabilities
-        .iter()
-        .flat_map(BTreeMap::keys)
-        .chain(answer.legend.iter().flat_map(BTreeMap::keys));
-    if let Some(level) = keys.find(|key| {
-        !matches!(key.as_bytes(), [b'0'] | [b'1'..=b'9', ..])
-            || !key.parse::<usize>().is_ok_and(|level| level < levels)
-    }) {
-        return Err(ResponseError::UnknownLevel {
-            question: name.to_owned(),
-            level: diagnostic::truncate(level, MAX_ERROR_LABEL_BYTES),
-        });
+    let expected = answer.probabilities.iter().flatten().try_fold(
+        0.0,
+        |expected: f64, (key, probability)| -> Result<f64, ResponseError> {
+            Ok(expected + level(name, key, levels)? * probability)
+        },
+    )?;
+    for key in answer.legend.iter().flat_map(BTreeMap::keys) {
+        level(name, key, levels)?;
     }
     if let Some(probabilities) = &answer.probabilities {
         let sum = distribution(name, probabilities.values().copied())?;
-        let expected: f64 = probabilities
-            .iter()
-            .filter_map(|(level, probability)| {
-                level
-                    .parse::<u32>()
-                    .ok()
-                    .map(|level| f64::from(level) * probability)
-            })
-            .sum();
         let highest = f64::from(u32::try_from(max).unwrap_or(u32::MAX));
-        let tolerance = PROBABILITY_TOLERANCE * highest;
-        let unlisted = (1.0 - sum).max(0.0) * highest;
-        if answer.score < expected - tolerance || answer.score > expected + unlisted + tolerance {
+        let missing_mass = (1.0 - sum).max(0.0);
+        let excess_mass = (sum - 1.0).max(0.0);
+        let lower = expected - excess_mass * highest - SCORE_TOLERANCE;
+        let upper = expected + missing_mass * highest + SCORE_TOLERANCE;
+        if !(lower..=upper).contains(&answer.score) {
             return Err(ResponseError::InconsistentScore {
                 question: name.to_owned(),
                 score: answer.score,
@@ -582,6 +572,20 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn level(name: &str, key: &str, levels: usize) -> Result<f64, ResponseError> {
+    key.parse::<u32>()
+        .ok()
+        .filter(|&level| {
+            matches!(key.as_bytes(), [b'0'] | [b'1'..=b'9', ..])
+                && usize::try_from(level).is_ok_and(|level| level < levels)
+        })
+        .map(f64::from)
+        .ok_or_else(|| ResponseError::UnknownLevel {
+            question: name.to_owned(),
+            level: diagnostic::truncate(key, MAX_ERROR_LABEL_BYTES),
+        })
 }
 
 fn probability(name: &str, value: f64) -> Result<(), ResponseError> {
@@ -605,7 +609,7 @@ fn distribution(name: &str, values: impl Iterator<Item = f64>) -> Result<f64, Re
         probability(name, value)?;
         sum += value;
     }
-    if (sum - 1.0).abs() <= PROBABILITY_TOLERANCE {
+    if (sum - 1.0).abs() <= PROBABILITY_SUM_TOLERANCE {
         Ok(sum)
     } else {
         Err(ResponseError::ProbabilitySum {
