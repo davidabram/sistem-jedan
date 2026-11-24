@@ -127,9 +127,9 @@ Unknown fields are rejected. Every question accepts optional `instructions`. Ins
 
 | `type` | `criteria` | Answer |
 | --- | --- | --- |
-| `noul` | optional `{ true, false }` | `noul`: probability 0–1 |
+| `noul` | optional `{ true, false }`; needs `instructions` if omitted | `noul`: probability 0–1 |
 | `choice` | required `{ id: "description", … }`, at least 2 | `choice`: an id; optional `probabilities` |
-| `score` | required `["lowest", …, "highest"]`, at least 2 | `score`: 0 to `length - 1`; optional `probabilities` and `legend` |
+| `score` | required `["lowest", …, "highest"]`, at least 2 | `score`: probability-weighted level from 0 to `length - 1`, often fractional; optional `probabilities` and `legend` |
 
 Non-refusal answers may also include `confidence`. Optional fields are `null` when missing. **Any answer can be `{ type: "refusal" }`, so always check `answer.type`.**
 
@@ -137,7 +137,7 @@ Non-refusal answers may also include `confidence`. Optional fields are `null` wh
 const { answers: a } = await system1.decide({
   state: "The export button does nothing in Safari.",
   questions: {
-    bug: { type: "noul" },
+    bug: { type: "noul", instructions: "Is this a bug?" },
     area: { type: "choice", criteria: { frontend: "Browser UI", backend: "Server or API" } },
     severity: { type: "score", criteria: ["Cosmetic", "Minor", "Major", "Blocking"] },
   },
@@ -226,7 +226,7 @@ To keep partial results, use `Promise.allSettled`:
 ```js
 const items = ["first", "second", "third"];
 const settled = await Promise.allSettled(items.map((item) =>
-  system1.decide({ state: item, questions: { relevant: { type: "noul" } } })
+  system1.decide({ state: item, questions: { relevant: { type: "noul", instructions: "Is this relevant?" } } })
 ));
 return settled.map((s) => s.status === "fulfilled" ? s.value.answers.relevant : { error: s.reason.kind });
 ```

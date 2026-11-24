@@ -92,13 +92,13 @@ impl Server {
 `system1.decide({{state, questions}})` uses the configured Decisions API. Unknown fields are rejected.
 - State is a string, object or array, nested at most {MAX_NESTING_DEPTH} levels.
 - Supply one or more named questions. Names use 1–{MAX_QUESTION_NAME_LEN} ASCII letters, digits, underscores or hyphens. Instructions and criteria descriptions must be nonblank.
-- `noul`: optional criteria `{{true: "...", false: "..."}}`. Answer has `noul` (probability 0–1).
+- `noul`: needs `instructions`, criteria `{{true: "...", false: "..."}}` or both. Answer has `noul` (probability 0–1).
 - `choice`: criteria map at least {MIN_CHOICES} IDs to descriptions. Answer has `choice` (an ID) and optional `probabilities`.
-- `score`: criteria list at least {MIN_SCORE_LEVELS} descriptions in ascending order. Answer has `score` (0 to criteria.length − 1), optional `probabilities` and `legend` with canonical decimal keys such as "0".
+- `score`: criteria list at least {MIN_SCORE_LEVELS} descriptions in ascending order. Answer has `score`, the probability-weighted level from 0 to criteria.length − 1 and often fractional (round it or take the most probable level for one level), optional `probabilities` and `legend` with canonical decimal keys such as "0".
 - Each question takes optional `instructions`. Answers may include `confidence`. Always check `answer.type` for `refusal` before reading type-specific fields.
 
 The decision resolves to `{{id, model, provider, answers, usage}}`, with answers keyed by question name. Example:
-`const d = await system1.decide({{state: "Checkout fails in Safari", questions: {{bug: {{type: "noul"}}}}}}); const a = d.answers.bug; return a.type === "noul" ? a.noul : null;`
+`const d = await system1.decide({{state: "Checkout fails in Safari", questions: {{bug: {{type: "noul", instructions: "Is this a bug?"}}}}}}); const a = d.answers.bug; return a.type === "noul" ? a.noul : null;`
 
 A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Invalid input spends no calls. Run independent decisions with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
 
