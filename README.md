@@ -2,158 +2,252 @@
 
 # sistem jedan
 
-> **Experimental.** This project is early and unstable. The tool interface, configuration format and error kinds may change without notice, and the Decisions API it targets is itself an alpha endpoint. Don't rely on it for anything important yet.
+An MCP server that lets AI coding agents run JavaScript that queries System 1 models through OpenRouter's [Decisions API](https://openrouter.ai/docs/guides/features/decisions).
 
-`sistem-jedan` is a minimal MCP server over stdio, built on the official `rmcp` Rust SDK. It gives an MCP client (such as Claude Code) a **code mode** for working with **System 1 models**: instead of making one tool call per decision, the agent writes a short JavaScript program that calls the model as many times as it needs, processes the answers, and returns only the result.
+> **Experimental.** The interface, config format and error kinds may change. The Decisions API is in alpha.
 
-It works with any System 1 model served through OpenRouter's [Decisions API](https://openrouter.ai/docs/guides/features/decisions). The model is just a string in the configuration, so switching models means changing one line.
+## What is it?
 
-## Code mode
+`sistem-jedan` (Croatian for "system one") is a small Rust MCP server with one tool: `execute`. It runs JavaScript in a sandboxed [QuickJS](https://bellard.org/quickjs/) engine, where `system1.decide()` asks a System 1 model for a structured judgment: a probability, a choice or a score.
 
-The server exposes exactly one tool, `execute`, taking `{ "code": string }`. The code runs in a sandboxed [QuickJS](https://bellard.org/quickjs/) engine (embedded via `rquickjs`) as the body of an async function, so `await` works at the top level and the result is whatever the code explicitly `return`s:
+**Why code mode?** Asking about 50 commits through a plain `decide` tool takes 50 tool calls, and all 50 answers land in the agent's context. With `execute`, the agent writes one script that runs the decisions concurrently, filters them, and returns only the risky ones.
 
-```js
-const values = await Promise.all([Promise.resolve(10), Promise.resolve(20)]);
-return { sum: values.reduce((a, b) => a + b, 0) };
-```
+The API key stays in the server's config. Scripts never see it and can reach the network only through `system1.decide()`.
 
-```json
-{ "result": { "sum": 30 } }
-```
+## Quick Start
 
-Why code instead of plain tool calls: when an agent has to ask a model about 50 items, 50 separate tool calls fill its context with intermediate results. In code mode it loops, fans out with `Promise.all`, filters and aggregates inside the sandbox, and only the final value comes back.
+You need [Nix](https://nixos.org/download/) with flakes (`x86_64-linux`, `aarch64-linux` or `aarch64-darwin`), an [OpenRouter](https://openrouter.ai) API key, and [Claude Code](https://claude.com/claude-code).
 
-### Sandbox
-
-Each call gets a fresh QuickJS runtime and context with no filesystem, environment, timers, or module access, and no network access other than `system1.decide()`. Execution is limited by a deadline (enforced with the QuickJS interrupt handler, so synchronous infinite loops are stopped) and a QuickJS heap limit, 5 seconds and 64 MiB by default; see [Configuration](#configuration). The heap limit covers JavaScript allocations only, not memory the server allocates in Rust (such as prepared decision requests and HTTP buffers), so it is not a cap on process memory.
-
-An execution completes when the promise returned by the code settles: its resolved value becomes the result, and a rejection of the returned promise, or of any promise the code awaits without catching it (including through `Promise.all`), fails the execution with kind `exception`. Promises that are neither awaited nor returned are detached: they are not guaranteed to finish before the execution ends, and their rejections do not fail it. Awaiting a promise that never settles fails with `never_settled`, or with `timeout` if work such as an HTTP request is still pending at the deadline.
-
-Every failure of an `execute` call returns a tool error (`isError: true`) with structured content `{ "error": { "kind", "message" } }`, where `kind` is `invalid_arguments` for malformed tool arguments, or one of `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `engine`, or `json`. Unknown tool names produce a JSON-RPC `-32602` error.
-
-## System 1 decisions
-
-When a `[provider]` is configured, JavaScript can call the configured System 1 model through one native function. `system1.decide({ state, questions })` returns a promise resolving to the validated response `{ id, model, provider, answers, usage }`, where `answers` is keyed by the question names. `state` is a string, object or array; `questions` holds one or more questions named with 1 to 64 ASCII letters, digits, `_` or `-`. The endpoint, model and API key always come from the configuration, and unknown input fields are rejected.
-
-| Question | Criteria | Answer |
-| --- | --- | --- |
-| `noul` | optional `{ true, false }` descriptions | `noul` (probability 0 to 1), optional `confidence` |
-| `choice` | required object of at least two `id: description` entries | `choice` (an id), optional `probabilities`, `confidence` |
-| `score` | required array of at least two ordered level descriptions | `score` (0 to levels − 1), optional `probabilities`, `legend`, `confidence` |
-
-Any question may be answered `{ type: "refusal" }` instead, so check `answer.type` before reading type-specific fields. Every question accepts optional `instructions`; the model's answers are validated against the questions before the promise resolves.
-
-Calls run concurrently, so one `execute` invocation can fan out and return only the processed result:
-
-```js
-const commits = [
-  { id: "a", message: "Fix race condition" },
-  { id: "b", message: "Change database schema" },
-];
-const results = await Promise.all(commits.map(async commit => {
-  const decision = await system1.decide({
-    state: commit,
-    questions: { risky: { type: "noul", instructions: "Could this change break production?" } },
-  });
-  const answer = decision.answers.risky;
-  return { id: commit.id, probability: answer.type === "noul" ? answer.noul : 0 };
-}));
-return results.filter(x => x.probability > 0.7);
-```
-
-A failed call rejects its promise with an `Error` named `System1Error` whose `kind` is one of `provider_not_configured`, `call_limit_exceeded`, `invalid_input`, `timeout`, `transport`, `authentication`, `http`, `invalid_response`, `encode`, or `limiter_closed`, so failures can be handled with `try`/`catch` or `Promise.allSettled`. Error messages never contain the API key.
-
-The execution deadline covers HTTP calls too; when it expires, pending requests are cancelled. At most `max_concurrent_requests` requests are in flight at once across all executions, and each execution may initiate at most `max_calls_per_execution` calls (calls rejected for invalid input do not count).
-
-The JSON serialization of each `system1.decide()` argument may be at most 1 MiB (1,048,576 bytes of UTF-8); larger inputs reject with kind `invalid_input` before any call budget is consumed. This fixed limit bounds the requests an execution can hold in Rust memory while they wait for an HTTP slot; it is not a limit on process memory or on the HTTP body, which also carries the model name.
-
-Stdout carries MCP messages only; diagnostics are logged to stderr. The process exits when the client closes stdin.
-
-## Installation with Nix
-
-The repository is a Nix flake exposing `packages.default` for `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. Flakes must be enabled (`experimental-features = nix-command flakes`).
-
-**Install into your user profile** (recommended):
+**1. Install**
 
 ```sh
-nix profile install github:davidabram/sistem-jedan
-# or, from a local checkout:
-nix profile install .
+nix profile add github:davidabram/sistem-jedan   # older Nix: nix profile install
 ```
 
-The binary is then available at `~/.nix-profile/bin/sistem-jedan`, a path that stays valid across upgrades (`nix profile upgrade sistem-jedan`) and garbage collection.
-
-**Try it without installing:**
+**2. Create the config** (owner-only permissions)
 
 ```sh
-nix run github:davidabram/sistem-jedan -- --config ./config.toml
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan"
+install -d -m 700 "$config_dir"
+(umask 077 && curl -fsSL -o "$config_dir/config.toml" \
+  https://raw.githubusercontent.com/davidabram/sistem-jedan/main/config.example.toml)
+"${EDITOR:-vi}" "$config_dir/config.toml"
 ```
 
-**Declaratively** with NixOS or home-manager, add the flake as an input and reference its package:
-
-```nix
-{
-  inputs.sistem-jedan.url = "github:davidabram/sistem-jedan";
-
-  # in a home-manager module:
-  home.packages = [
-    inputs.sistem-jedan.packages.${pkgs.stdenv.hostPlatform.system}.default
-  ];
-  # or in a NixOS module: environment.systemPackages = [ ... ];
-}
-```
-
-Avoid registering a `/nix/store/...` path taken from `./result`: once that build is replaced and garbage-collected, the path disappears and the MCP registration breaks.
-
-## Configuration
-
-Configuration is read from `--config <path>` (or `--config=<path>`), otherwise from `$XDG_CONFIG_HOME/sistem-jedan/config.toml`, falling back to `~/.config/sistem-jedan/config.toml`. An explicit `--config` path must exist; if the default file is absent, the server starts with default execution limits and no provider.
+**3. Set your key and model.** Replace the placeholder `api_key` with your OpenRouter key. `model` can be any Decisions API model:
 
 ```toml
 [provider]
 endpoint = "https://openrouter.ai/api/alpha/decisions"
-model = "typesafe/jev-1.14"
+model = "typesafe/jev-1.14"          # any Decisions API model
 api_key = "<your OpenRouter API key>"
-
-[execution]
-timeout_seconds = 5
-memory_limit_mb = 64
-max_concurrent_requests = 8
-max_calls_per_execution = 32
 ```
 
-`[provider]` selects the System 1 model and is required in a configuration file. `model` can be any model the Decisions API serves; `typesafe/jev-1.14` is only an example. `endpoint` must be an `https` URL with a host and without embedded credentials, a query string or a fragment. `api_key` holds your OpenRouter API key; since the file contains a secret, restrict it with `chmod 600`. `[execution]` and each of its fields are optional and default to the values shown; `timeout_seconds` must be between 1 and 3600, and every other value must be at least 1. Unknown keys are rejected.
-
-The configuration is validated at startup; any problem is logged and the process exits with an error. The API key is never logged, never returned in MCP responses, and never made visible to JavaScript. Without a provider, ordinary JavaScript still runs and `system1.decide()` rejects with `provider_not_configured`.
-
-To install the configuration, copy [`config.example.toml`](config.example.toml) to the XDG path with owner-only permissions, then replace the placeholder API key:
-
-```sh
-install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan"
-(umask 077 && curl -fsSL -o "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan/config.toml" \
-  https://raw.githubusercontent.com/davidabram/sistem-jedan/main/config.example.toml)
-"${EDITOR:-vi}" "${XDG_CONFIG_HOME:-$HOME/.config}/sistem-jedan/config.toml"
-```
-
-From a local checkout, use `install -m 600 config.example.toml <path>` instead of `curl`. A repository-local `config.toml` (for use with `--config config.toml`) is ignored by Git.
-
-## Claude Code integration
-
-After installing with `nix profile install`, register the server:
+**4. Register with Claude Code**
 
 ```sh
 claude mcp add --scope user --transport stdio sistem-jedan -- ~/.nix-profile/bin/sistem-jedan
 ```
 
-If you installed declaratively, use the binary's path on your `PATH` instead (for example `"$(command -v sistem-jedan)"`).
+**5. Verify**
 
-Options (`--scope`, `--transport`) must come before the server name; everything after `--` is the command Claude Code runs. Check the registration with `claude mcp get sistem-jedan`, or `/mcp` inside a Claude Code session. Remove it with `claude mcp remove --scope user sistem-jedan`.
+```sh
+claude mcp get sistem-jedan
+```
+
+If it fails to connect, run `~/.nix-profile/bin/sistem-jedan` directly. A bad config is logged to stderr and the server exits. A good config leaves it waiting on stdin; press Ctrl-D to stop it.
+
+**6. Try it.** In Claude Code, ask:
+
+> Use the sistem-jedan execute tool to ask system1 whether a commit titled "Drop legacy users table" is risky.
+
+## Your first decision
+
+`execute` takes `{ "code": string }`. The code is the **body of an async function**, so top-level `await` works and you must `return` the result.
+
+```js
+const decision = await system1.decide({
+  state: { file: "src/checkout.js", diff: "-  total = subtotal + tax;\n+  total = subtotal;" },
+  questions: {
+    risky: { type: "noul", instructions: "Could this break production?" },
+  },
+});
+
+const answer = decision.answers.risky;
+if (answer.type === "refusal") return { risky: null }; // no answer, not 0
+return { risky: answer.noul };
+```
+
+```json
+{ "result": { "risky": 0.93 } }
+```
+
+The probability is model output and varies between runs.
+
+The resolved object contains `answers` (keyed by question name), `model`, `id` and `provider` (either may be `null`), and `usage` (token counts; cost fields may be `null`).
+
+## How code mode works
+
+```text
+agent ── execute({ code }) ──▶ QuickJS ── system1.decide() ──▶ Decisions API
+agent ◀── { "result": … } ──── QuickJS ◀── validated answers ──┘
+```
+
+Between calls it's plain JavaScript. Only the returned value goes back to the agent:
+
+```js
+const commits = [
+  { sha: "a1f3", message: "Fix typo in README" },
+  { sha: "b7c2", message: "Drop legacy users table" },
+];
+
+const results = await Promise.all(commits.map(async (commit) => {
+  const { answers } = await system1.decide({
+    state: commit,
+    questions: { risky: { type: "noul", instructions: "Could this break production?" } },
+  });
+  const a = answers.risky;
+  return { sha: commit.sha, risk: a.type === "noul" ? a.noul : null };
+}));
+
+return {
+  risky: results.filter((r) => r.risk !== null && r.risk > 0.7),
+  unanswered: results.filter((r) => r.risk === null).map((r) => r.sha),
+};
+```
+
+## Decisions API
+
+`system1.decide({ state, questions })`
+
+- `state` is a string, object or array, nested at most 64 levels deep.
+- `questions` maps names (1–64 chars: `A-Z a-z 0-9 _ -`) to questions. Answers come back under the same names.
+
+Unknown fields are rejected. Every question accepts optional `instructions`. Instructions and criteria must not be blank.
+
+| `type` | `criteria` | Answer |
+| --- | --- | --- |
+| `noul` | optional `{ true, false }` | `noul`: probability 0–1 |
+| `choice` | required `{ id: "description", … }`, at least 2 | `choice`: an id; optional `probabilities` |
+| `score` | required `["lowest", …, "highest"]`, at least 2 | `score`: 0 to `length - 1`; optional `probabilities` and `legend` |
+
+Non-refusal answers may also include `confidence`. Optional fields are `null` when missing. **Any answer can be `{ type: "refusal" }`, so always check `answer.type`.**
+
+```js
+const { answers: a } = await system1.decide({
+  state: "The export button does nothing in Safari.",
+  questions: {
+    bug: { type: "noul" },
+    area: { type: "choice", criteria: { frontend: "Browser UI", backend: "Server or API" } },
+    severity: { type: "score", criteria: ["Cosmetic", "Minor", "Major", "Blocking"] },
+  },
+});
+return {
+  bug: a.bug.type === "noul" ? a.bug.noul : null,
+  area: a.area.type === "choice" ? a.area.choice : null,
+  severity: a.severity.type === "score" ? a.severity.score : null,
+};
+```
+
+Responses that don't match your questions reject with `invalid_response`.
+
+## Configuration
+
+The server looks for config in this order:
+
+1. `--config <path>`, which must exist. This is the only CLI option.
+2. `$XDG_CONFIG_HOME/sistem-jedan/config.toml`, falling back to `~/.config/sistem-jedan/config.toml`.
+3. If neither exists, the server starts without a provider and `system1.decide()` rejects with `provider_not_configured`.
+
+```toml
+[provider]                     # required
+endpoint = "https://openrouter.ai/api/alpha/decisions"   # https, no credentials/query/fragment
+model = "typesafe/jev-1.14"
+api_key = "<your OpenRouter API key>"
+
+[execution]                    # optional; defaults shown
+timeout_seconds = 5            # whole execution, including HTTP (1–3600)
+memory_limit_mb = 64           # QuickJS heap
+max_concurrent_requests = 8    # in-flight requests, shared across executions
+max_calls_per_execution = 32   # decide() calls per execute
+```
+
+Unknown keys are rejected. An invalid config is logged to stderr, and the server exits. If your scripts chain several decisions, raise `timeout_seconds`.
+
+**Keep the file at mode `600` and never commit it.** The key is never logged, returned to the agent or exposed to JavaScript.
+
+## Limits and sandbox
+
+Every `execute` call gets a fresh QuickJS runtime. Scripts have no filesystem, environment variables, modules, timers or network access other than `system1.decide()`.
+
+| Limit | Exceeded → |
+| --- | --- |
+| `timeout_seconds` | `timeout` (also stops infinite loops) |
+| `memory_limit_mb` | `out_of_memory` |
+| `max_concurrent_requests` | extra calls queue, and the wait counts toward the deadline |
+| `max_calls_per_execution` | `call_limit_exceeded` |
+| 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (doesn't use up the call budget) |
+
+The memory limit covers the JavaScript heap only, not the server's Rust allocations. Calls count toward the budget once their input passes validation, even if they fail later.
+
+## Errors
+
+An execution ends when the returned promise settles.
+
+- If the code returns nothing, it fails with `missing_return`. If the return value can't be converted to JSON, it fails with `unsupported_result`.
+- A rejection that propagates through the returned promise fails with `exception`.
+- **Detached promises** (neither awaited nor returned) may never finish, and their rejections are ignored.
+
+A failed `execute` call returns `isError: true` with:
+
+```json
+{ "error": { "kind": "timeout", "message": "execution exceeded the 5000ms deadline" } }
+```
+
+The possible kinds are `invalid_arguments`, `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `engine` and `json`.
+
+A failed `system1.decide()` call rejects with a `System1Error` that has a `kind` property:
+
+| `kind` | Meaning |
+| --- | --- |
+| `provider_not_configured` | no config file |
+| `invalid_input` | bad, unserializable or oversized input |
+| `call_limit_exceeded` | per-execution budget used up |
+| `authentication` | HTTP 401/403: check `api_key` |
+| `http`, `timeout`, `transport` | other HTTP, timeout or network failures |
+| `invalid_response` | response didn't match the questions |
+
+To keep partial results, use `Promise.allSettled`:
+
+```js
+const items = ["first", "second", "third"];
+const settled = await Promise.allSettled(items.map((item) =>
+  system1.decide({ state: item, questions: { relevant: { type: "noul" } } })
+));
+return settled.map((s) => s.status === "fulfilled" ? s.value.answers.relevant : { error: s.reason.kind });
+```
+
+## Other ways to install
+
+```sh
+nix run github:davidabram/sistem-jedan -- --config ./config.toml   # run without installing
+nix profile add .                                                  # from a local checkout
+nix profile upgrade sistem-jedan                                   # upgrade
+```
+
+With NixOS or home-manager, add `inputs.sistem-jedan.url = "github:davidabram/sistem-jedan"` and install `inputs.sistem-jedan.packages.${pkgs.stdenv.hostPlatform.system}.default`. Then register the binary with `"$(command -v sistem-jedan)"`.
+
+Don't register a `/nix/store/...` path from `./result`. It breaks after garbage collection.
 
 ## Development
 
 ```sh
-nix develop            # or `direnv allow`; shell with rustc, cargo, rustfmt, clippy, rust-analyzer
-nix build              # build the binary into ./result
-nix flake check        # build and run tests
-nix fmt flake.nix      # format Nix files with nixfmt
+nix develop        # or `direnv allow`
+nix build          # binary in ./result
+cargo fmt
+cargo clippy       # pedantic lints enabled
+nix flake check    # builds the package and runs its cargo tests
+nix fmt flake.nix
 ```
+
+MCP traffic goes over stdio, logs go to stderr, and the server exits when stdin closes.
