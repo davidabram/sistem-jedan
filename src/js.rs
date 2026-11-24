@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::function::Async;
@@ -11,6 +12,7 @@ use rquickjs::{
 use tokio::sync::Semaphore;
 
 use crate::decisions::{self, DecisionsError, Request};
+use crate::memory::LimitedAllocator;
 
 pub const STACK_LIMIT: usize = 512 * 1024;
 const SYSTEM1_ERROR: &str = "System1Error";
@@ -194,8 +196,8 @@ pub async fn run(
     system1: Arc<System1>,
 ) -> Result<serde_json::Value, JsError> {
     let deadline = Instant::now() + limits.timeout;
-    let runtime = AsyncRuntime::new()?;
-    runtime.set_memory_limit(limits.memory_limit).await;
+    let (allocator, exceeded) = LimitedAllocator::new(limits.memory_limit);
+    let runtime = AsyncRuntime::new_with_alloc(allocator)?;
     runtime.set_max_stack_size(STACK_LIMIT).await;
     runtime
         .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
@@ -203,15 +205,11 @@ pub async fn run(
     let context = AsyncContext::full(&runtime).await?;
     let source = format!("(async () => {{\n{code}\n}})()");
     let execution = context.async_with(async move |ctx| {
-        install(&ctx, system1).map_err(|error| caught(&ctx, error, deadline, limits))?;
-        let promise = ctx
-            .eval::<Promise, _>(source)
-            .map_err(|error| caught(&ctx, error, deadline, limits))?;
-        let value = promise
-            .into_future::<Value>()
-            .await
-            .map_err(|error| caught(&ctx, error, deadline, limits))?;
-        to_json(&ctx, value, deadline, limits)
+        let caught = |error| caught(&ctx, error, deadline, limits, &exceeded);
+        install(&ctx, system1).map_err(caught)?;
+        let promise = ctx.eval::<Promise, _>(source).map_err(caught)?;
+        let value = promise.into_future::<Value>().await.map_err(caught)?;
+        to_json(&ctx, value, caught)
     });
     match tokio::time::timeout_at(deadline.into(), execution).await {
         Ok(result) => result,
@@ -246,8 +244,7 @@ fn install<'js>(ctx: &Ctx<'js>, system1: Arc<System1>) -> rquickjs::Result<()> {
 fn to_json<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,
-    deadline: Instant,
-    limits: Limits,
+    caught: impl FnOnce(rquickjs::Error) -> JsError,
 ) -> Result<serde_json::Value, JsError> {
     if value.is_undefined() {
         return Err(JsError::MissingReturn);
@@ -262,7 +259,7 @@ fn to_json<'js>(
             Ok(serde_json::from_str(json.as_str())?)
         }
         Ok(None) => Err(JsError::UnsupportedResult(type_name.to_owned())),
-        Err(error) => match caught(ctx, error, deadline, limits) {
+        Err(error) => match caught(error) {
             JsError::Exception(message) => Err(JsError::UnsupportedResult(message)),
             error => Err(error),
         },
@@ -279,7 +276,13 @@ fn caught_message(error: &CaughtError<'_>) -> String {
     }
 }
 
-fn caught(ctx: &Ctx<'_>, error: rquickjs::Error, deadline: Instant, limits: Limits) -> JsError {
+fn caught(
+    ctx: &Ctx<'_>,
+    error: rquickjs::Error,
+    deadline: Instant,
+    limits: Limits,
+    exceeded: &AtomicBool,
+) -> JsError {
     match error {
         rquickjs::Error::Exception => {}
         rquickjs::Error::Allocation => return JsError::OutOfMemory(limits.memory_limit),
@@ -288,6 +291,9 @@ fn caught(ctx: &Ctx<'_>, error: rquickjs::Error, deadline: Instant, limits: Limi
     let thrown = ctx.catch();
     if Instant::now() >= deadline {
         return JsError::Timeout(limits.timeout);
+    }
+    if thrown.is_null() && exceeded.load(Ordering::Relaxed) {
+        return JsError::OutOfMemory(limits.memory_limit);
     }
     let Some(exception) = thrown.as_exception() else {
         return match thrown.get::<Coerced<String>>() {

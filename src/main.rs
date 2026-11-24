@@ -2,6 +2,7 @@ mod config;
 mod decisions;
 mod js;
 mod mcp;
+mod memory;
 
 use rmcp::ServiceExt;
 use rmcp::service::{QuitReason, ServerInitializeError};
