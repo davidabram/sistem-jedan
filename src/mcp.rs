@@ -16,6 +16,7 @@ use crate::js::{self, JsError, Limits, System1};
 
 pub const EXECUTE: &str = "execute";
 const MAX_DECISION_INPUT_MIB: usize = js::MAX_DECISION_INPUT_BYTES / (1024 * 1024);
+const MAX_EXECUTE_RESULT_MIB: usize = js::MAX_EXECUTE_RESULT_BYTES / (1024 * 1024);
 const EXECUTE_DESCRIPTION: &str = r#"Runs JavaScript in a fresh, isolated QuickJS runtime. `code` is the body of an async function: top-level `await` works, and you must explicitly `return` a JSON-serializable value, which comes back as `{"result": value}`. Execution ends when the returned promise settles, so await or return every promise whose outcome matters; detached promises are not guaranteed to finish and their rejections are ignored. There is no filesystem, environment, timers, modules or network access other than system1.decide().
 
 system1.decide({ state, questions }) asks the configured System 1 model (Decisions API). The endpoint, model and API key are server configuration, never arguments. Unknown fields are rejected.
@@ -30,7 +31,7 @@ Example: const d = await system1.decide({ state: diff, questions: { risky: { typ
 
 A failed decision rejects with an Error named "System1Error" whose `kind` is one of provider_not_configured, call_limit_exceeded, invalid_input, timeout, transport, authentication, http, invalid_response, encode or limiter_closed. Invalid or oversized input does not consume the call budget. Use try/catch, Promise.all for concurrent calls and Promise.allSettled to collect individual failures; an uncaught rejection fails the execution with kind `exception`.
 
-Execution failures return `{"error": {"kind", "message"}}` with isError: true, where kind is one of invalid_arguments, exception, timeout, out_of_memory, never_settled, missing_return, unsupported_result, engine or json."#;
+Execution failures return `{"error": {"kind", "message"}}` with isError: true, where kind is one of invalid_arguments, exception, timeout, out_of_memory, never_settled, missing_return, unsupported_result, result_too_large, engine or json."#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -80,7 +81,7 @@ impl Server {
         Tool::new(
             EXECUTE,
             format!(
-                "{EXECUTE_DESCRIPTION}\n\nLimits: a {} s deadline and a {} MiB QuickJS heap per execution, at most {} system1.decide() calls per execution, and at most {MAX_DECISION_INPUT_MIB} MiB of serialized JSON per decide() argument.",
+                "{EXECUTE_DESCRIPTION}\n\nLimits: a {} s deadline and a {} MiB QuickJS heap per execution, at most {} system1.decide() calls per execution, and at most {MAX_DECISION_INPUT_MIB} MiB of serialized JSON per decide() argument. The returned JSON result is limited to {MAX_EXECUTE_RESULT_MIB} MiB of serialized UTF-8; larger results fail with `result_too_large`. Filter or aggregate data in JavaScript before returning it.",
                 self.limits.timeout.as_secs(),
                 self.limits.memory_limit / (1024 * 1024),
                 self.system1.max_calls(),

@@ -15,6 +15,7 @@ use crate::decisions::{self, DecisionsError, Request};
 pub const STACK_LIMIT: usize = 512 * 1024;
 const SYSTEM1_ERROR: &str = "System1Error";
 pub const MAX_DECISION_INPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_EXECUTE_RESULT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -43,6 +44,8 @@ pub enum JsError {
     MissingReturn,
     #[error("result is not JSON-serializable: {0}")]
     UnsupportedResult(String),
+    #[error("serialized execution result exceeds the {MAX_EXECUTE_RESULT_BYTES} byte limit")]
+    ResultTooLarge,
     #[error("JavaScript engine error: {0}")]
     Engine(#[from] rquickjs::Error),
     #[error("result JSON is invalid: {0}")]
@@ -79,6 +82,7 @@ impl JsError {
             Self::NeverSettled => "never_settled",
             Self::MissingReturn => "missing_return",
             Self::UnsupportedResult(_) => "unsupported_result",
+            Self::ResultTooLarge => "result_too_large",
             Self::Engine(_) => "engine",
             Self::Json(_) => "json",
         }
@@ -250,7 +254,13 @@ fn to_json<'js>(
     }
     let type_name = value.type_name();
     match ctx.json_stringify(value) {
-        Ok(Some(json)) => Ok(serde_json::from_str(&json.to_string()?)?),
+        Ok(Some(json)) => {
+            let json = json.to_cstring()?;
+            if json.len() > MAX_EXECUTE_RESULT_BYTES {
+                return Err(JsError::ResultTooLarge);
+            }
+            Ok(serde_json::from_str(json.as_str())?)
+        }
         Ok(None) => Err(JsError::UnsupportedResult(type_name.to_owned())),
         Err(error) => match caught(ctx, error, deadline, limits) {
             JsError::Exception(message) => Err(JsError::UnsupportedResult(message)),

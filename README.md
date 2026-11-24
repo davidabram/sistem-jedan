@@ -187,6 +187,7 @@ Every `execute` call gets a fresh QuickJS runtime. Scripts have no filesystem, e
 | `max_concurrent_requests` | extra calls queue, and the wait counts toward the deadline |
 | `max_calls_per_execution` | `call_limit_exceeded` |
 | 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (doesn't use up the call budget) |
+| 1 MiB of serialized UTF-8 JSON in the returned result (fixed) | `result_too_large` (filter or aggregate in JavaScript before returning) |
 
 The memory limit covers the JavaScript heap only, not the server's Rust allocations. Calls count toward the budget once their input passes validation, even if they fail later.
 
@@ -204,7 +205,7 @@ A failed `execute` call returns `isError: true` with:
 { "error": { "kind": "timeout", "message": "execution exceeded the 5000ms deadline" } }
 ```
 
-The possible kinds are `invalid_arguments`, `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `engine` and `json`.
+The possible kinds are `invalid_arguments`, `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `result_too_large`, `engine` and `json`.
 
 A failed `system1.decide()` call rejects with a `System1Error` that has a `kind` property:
 
