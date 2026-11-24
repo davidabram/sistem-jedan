@@ -66,6 +66,10 @@ pub(super) enum ConfigError {
     InvalidVcpuPerExecution,
     #[error("execution.max_calls_per_execution must be at least 1")]
     InvalidMaxCallsPerExecution,
+    #[error(
+        "execution.max_decision_input_total_mb must be at least 1 and fit in addressable memory"
+    )]
+    InvalidMaxDecisionInputTotal,
 }
 
 pub(super) struct Provider {
@@ -86,6 +90,7 @@ pub(super) struct ExecutionSettings {
     pub(super) max_concurrent_requests: usize,
     pub(super) max_concurrent_executions: usize,
     pub(super) max_calls_per_execution: NonZeroU32,
+    pub(super) max_decision_input_total: NonZeroUsize,
 }
 
 impl ExecutionSettings {
@@ -98,6 +103,7 @@ impl ExecutionSettings {
         max_concurrent_requests: 8,
         max_concurrent_executions: 4,
         max_calls_per_execution: NonZeroU32::new(32).unwrap(),
+        max_decision_input_total: NonZeroUsize::new(8 * BYTES_PER_MIB).unwrap(),
     };
 }
 
@@ -145,6 +151,7 @@ struct RawExecution {
     max_concurrent_requests: usize,
     max_concurrent_executions: usize,
     max_calls_per_execution: u32,
+    max_decision_input_total_mb: usize,
 }
 
 impl Default for RawExecution {
@@ -157,6 +164,7 @@ impl Default for RawExecution {
             max_concurrent_requests: settings.max_concurrent_requests,
             max_concurrent_executions: settings.max_concurrent_executions,
             max_calls_per_execution: settings.max_calls_per_execution.get(),
+            max_decision_input_total_mb: settings.max_decision_input_total.get() / BYTES_PER_MIB,
         }
     }
 }
@@ -183,6 +191,11 @@ impl RawExecution {
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_executions) {
             return Err(ConfigError::InvalidMaxConcurrentExecutions);
         }
+        let max_decision_input_total = self
+            .max_decision_input_total_mb
+            .checked_mul(BYTES_PER_MIB)
+            .and_then(NonZeroUsize::new)
+            .ok_or(ConfigError::InvalidMaxDecisionInputTotal)?;
         Ok(ExecutionSettings {
             limits: Limits {
                 timeout: Duration::from_secs(self.timeout_seconds),
@@ -193,6 +206,7 @@ impl RawExecution {
             max_concurrent_executions: self.max_concurrent_executions,
             max_calls_per_execution: NonZeroU32::new(self.max_calls_per_execution)
                 .ok_or(ConfigError::InvalidMaxCallsPerExecution)?,
+            max_decision_input_total,
         })
     }
 }

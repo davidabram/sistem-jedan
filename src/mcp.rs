@@ -20,7 +20,7 @@ use crate::decisions::{
 };
 use crate::diagnostic;
 use crate::js::{
-    self, CALL_LIMIT_KIND, INVALID_INPUT_KIND, JsError, OUT_OF_MEMORY_KIND,
+    self, CALL_LIMIT_KIND, INPUT_BUDGET_KIND, INVALID_INPUT_KIND, JsError, OUT_OF_MEMORY_KIND,
     PROVIDER_NOT_CONFIGURED_KIND, SYSTEM1_ERROR, System1, TIMEOUT_KIND,
 };
 use crate::memory;
@@ -80,6 +80,7 @@ impl Server {
             client,
             settings.max_concurrent_requests,
             settings.max_calls_per_execution,
+            settings.max_decision_input_total,
         );
         Self {
             executions: Arc::new(Semaphore::new(settings.max_concurrent_executions)),
@@ -106,9 +107,9 @@ impl Server {
 The decision resolves to `{{id, model, provider, answers, usage}}`, with answers keyed by question name. `id`, `provider`, `confidence` and the `usage` cost fields may be `null`. Example:
 `const d = await system1.decide({{state: "Checkout fails in Safari", questions: {{bug: {{type: "noul", instructions: "Is this a bug?"}}}}}}); const a = d.answers.bug; return a.type === "noul" ? a.noul : null;`
 
-A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Invalid input spends no calls. Clients may run tool calls one at a time, so run independent decisions inside one script with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
+A decision can reject with a `{SYSTEM1_ERROR}` whose `kind` explains the failure, including `{PROVIDER_NOT_CONFIGURED_KIND}`, `{CALL_LIMIT_KIND}`, `{INPUT_BUDGET_KIND}`, `{INVALID_INPUT_KIND}` and provider failures. Serialized input within the per-decision limit is charged to the execution's input budget before validation and is never refunded. A call is charged only once its input validates, so invalid input spends input bytes but no calls. Clients may run tool calls one at a time, so run independent decisions inside one script with Promise.all and use try/catch or Promise.allSettled to keep partial results. An uncaught decision rejection fails the execution.
 
-Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocations, {cpu}{calls} decision calls, {MAX_DECISION_INPUT_MIB} MiB of JSON per decision input and {MAX_EXECUTE_RESULT_MIB} MiB of JSON for the result. At most {executions} executions and {requests} inference requests run concurrently. Inference waits count toward the deadline.
+Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocations (host memory used outside QuickJS is not counted), {cpu}{calls} decision calls, {MAX_DECISION_INPUT_MIB} MiB of JSON per decision input, {input_total} MiB of admitted decision input JSON in total and {MAX_EXECUTE_RESULT_MIB} MiB of JSON for the result. At most {executions} executions and {requests} inference requests run concurrently. Inference waits count toward the deadline.
 
 Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true`. Excess executions fail immediately with `{capacity}`. Pending promises and running code both fail with `{TIMEOUT_KIND}` on deadline expiry. Allocator exhaustion fails with `{OUT_OF_MEMORY_KIND}`. Use an explicit return to avoid `{missing}` and filter or aggregate results to avoid `{too_large}`."#,
                 timeout = settings.limits.timeout.as_secs(),
@@ -118,6 +119,7 @@ Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true
                     .vcpu_per_execution
                     .map_or_default(|share| format!("{share} vCPU (CPU-bound code is paused to stay under it), ")),
                 calls = settings.max_calls_per_execution,
+                input_total = settings.max_decision_input_total.get() / BYTES_PER_MIB,
                 executions = settings.max_concurrent_executions,
                 requests = settings.max_concurrent_requests,
                 capacity = ExecuteError::AtCapacity.kind(),

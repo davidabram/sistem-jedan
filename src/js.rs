@@ -20,6 +20,7 @@ use crate::memory::LimitedAllocator;
 pub(super) const TIMEOUT_KIND: &str = "timeout";
 pub(super) const INVALID_INPUT_KIND: &str = "invalid_input";
 pub(super) const CALL_LIMIT_KIND: &str = "call_limit_exceeded";
+pub(super) const INPUT_BUDGET_KIND: &str = "input_budget_exceeded";
 pub(super) const PROVIDER_NOT_CONFIGURED_KIND: &str = "provider_not_configured";
 pub(super) const OUT_OF_MEMORY_KIND: &str = "out_of_memory";
 const STACK_LIMIT: usize = 512 * 1024;
@@ -38,6 +39,13 @@ pub(super) struct System1 {
     client: Option<decisions::Client>,
     permits: Semaphore,
     max_calls: NonZeroU32,
+    max_input_bytes: NonZeroUsize,
+}
+
+#[derive(Clone, Copy)]
+struct Budget {
+    calls: u32,
+    input_bytes: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +80,8 @@ enum DecideError {
     Unserializable(String),
     #[error("serialized decision input exceeds the {MAX_DECISION_INPUT_BYTES} byte limit")]
     InputTooLarge,
+    #[error("system1.decide() may admit at most {0} bytes of serialized input per execution")]
+    InputBudgetExceeded(NonZeroUsize),
     #[error("invalid decision input: {0}")]
     InvalidInput(#[from] RequestError),
     #[error(transparent)]
@@ -104,6 +114,7 @@ impl DecideError {
         match self {
             Self::ProviderNotConfigured => PROVIDER_NOT_CONFIGURED_KIND,
             Self::CallLimitExceeded(_) => CALL_LIMIT_KIND,
+            Self::InputBudgetExceeded(_) => INPUT_BUDGET_KIND,
             Self::Unserializable(_) | Self::InputTooLarge | Self::InvalidInput(_) => {
                 INVALID_INPUT_KIND
             }
@@ -135,11 +146,13 @@ impl System1 {
         client: Option<decisions::Client>,
         max_concurrent_requests: usize,
         max_calls: NonZeroU32,
+        max_input_bytes: NonZeroUsize,
     ) -> Self {
         Self {
             client,
             permits: Semaphore::new(max_concurrent_requests),
             max_calls,
+            max_input_bytes,
         }
     }
 
@@ -147,13 +160,16 @@ impl System1 {
         &self,
         ctx: &Ctx<'js>,
         input: Value<'js>,
-        remaining: &Cell<u32>,
+        budget: &Cell<Budget>,
     ) -> Result<ValidatedRequest, DecideError> {
         if self.client.is_none() {
             return Err(DecideError::ProviderNotConfigured);
         }
-        if remaining.get() == 0 {
+        if budget.get().calls == 0 {
             return Err(DecideError::CallLimitExceeded(self.max_calls));
+        }
+        if budget.get().input_bytes == 0 {
+            return Err(DecideError::InputBudgetExceeded(self.max_input_bytes));
         }
         let json = match ctx.json_stringify(input) {
             Ok(Some(json)) => json.to_cstring(),
@@ -168,12 +184,25 @@ impl System1 {
         if json.len() > MAX_DECISION_INPUT_BYTES {
             return Err(DecideError::InputTooLarge);
         }
+        let current = budget.get();
+        if current.calls == 0 {
+            return Err(DecideError::CallLimitExceeded(self.max_calls));
+        }
+        let input_bytes = current
+            .input_bytes
+            .checked_sub(json.len())
+            .ok_or(DecideError::InputBudgetExceeded(self.max_input_bytes))?;
+        budget.set(Budget {
+            input_bytes,
+            ..current
+        });
         let request = ValidatedRequest::from_json(c_bytes(&json))?;
-        let left = remaining
-            .get()
+        let current = budget.get();
+        let calls = current
+            .calls
             .checked_sub(1)
             .ok_or(DecideError::CallLimitExceeded(self.max_calls))?;
-        remaining.set(left);
+        budget.set(Budget { calls, ..current });
         Ok(request)
     }
 
@@ -318,11 +347,14 @@ fn install<'js>(
     system1: Arc<System1>,
     execution: Execution,
 ) -> rquickjs::Result<()> {
-    let remaining = Cell::new(system1.max_calls.get());
+    let budget = Cell::new(Budget {
+        calls: system1.max_calls.get(),
+        input_bytes: system1.max_input_bytes.get(),
+    });
     let decide = Function::new(
         ctx.clone(),
         Async(move |ctx: Ctx<'js>, input: Value<'js>| {
-            let request = system1.prepare(&ctx, input, &remaining);
+            let request = system1.prepare(&ctx, input, &budget);
             let system1 = Arc::clone(&system1);
             let execution = execution.clone();
             async move {

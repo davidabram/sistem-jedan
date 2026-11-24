@@ -149,7 +149,7 @@ return {
 };
 ```
 
-Score probability and legend keys use canonical decimal levels such as `"0"` and `"1"`. Sparse maps are allowed. Responses that fail validation reject with `invalid_response`.
+Score probability and legend keys use canonical decimal levels such as `"0"` and `"1"`. Sparse maps are allowed. Responses are also checked for internal consistency: a `choice` must be no less probable than any other listed choice, and a `score` must match the probability-weighted level of its `probabilities`, both within a small rounding tolerance. Responses that fail validation reject with `invalid_response`.
 
 ## Configuration
 
@@ -172,6 +172,7 @@ memory_limit_mb = 64           # QuickJS backing allocations
 max_concurrent_requests = 8    # in-flight inference requests, shared across executions
 max_concurrent_executions = 4   # live QuickJS runtimes, shared across the server
 max_calls_per_execution = 32   # decide() calls per execute
+max_decision_input_total_mb = 8 # serialized decide() input admitted per execute
 ```
 
 Unknown keys are rejected. An invalid config is logged to stderr, and the server exits. If your scripts chain several decisions, raise `timeout_seconds`.
@@ -209,13 +210,16 @@ Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no file
 | `max_concurrent_executions` | `execution_capacity` immediately, before runtime creation |
 | `max_concurrent_requests` | extra calls queue, and the wait counts toward the deadline |
 | `max_calls_per_execution` | `call_limit_exceeded` |
+| `max_decision_input_total_mb` | `input_budget_exceeded` |
 | 1 MiB of UTF-8 JavaScript source (fixed) | `invalid_arguments` |
-| 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (doesn't use up the call budget) |
+| 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (uses up neither budget) |
 | 1 MiB of serialized UTF-8 JSON in the returned result (fixed) | `result_too_large` (filter or aggregate in JavaScript before returning) |
 
-The memory limit counts live QuickJS backing allocations, including runtime initialization, arenas and allocator headers. It excludes global allocator overhead, any temporary space used internally by the global allocator during reallocation, and separate allocations made by Rust, the transport or the HTTP client. Calls count toward the budget once their input passes validation, even if they fail later.
+The memory limit counts live QuickJS backing allocations, including runtime initialization, arenas and allocator headers. It excludes global allocator overhead, any temporary space used internally by the global allocator during reallocation, and separate allocations made by Rust, the transport or the HTTP client. It is not a limit on process memory.
 
-Each execution runs on its own thread, so CPU-bound scripts don't delay MCP requests or inference responses. With `vcpu_per_execution`, the server measures each execution's thread CPU time and pauses it whenever it gets ahead of its share, so busy scripts use at most `max_concurrent_executions` × `vcpu_per_execution` CPUs in total. Time spent waiting on `system1.decide()` earns at most 10 ms of extra CPU, and a single native call, such as filling a large typed array, is only paused after it returns. To size a container, give it that much CPU plus some headroom for the server, and at least 60 MB + `max_concurrent_executions` × `memory_limit_mb` of memory.
+Each `decide()` call has two independent per-execution budgets. Its serialized input is charged to `max_decision_input_total_mb` as soon as it fits the 1 MiB per-decision limit, before it is parsed and validated, and those bytes stay charged for the rest of the execution, whether the call fails validation, fails at the provider, times out or succeeds. One call is charged to `max_calls_per_execution` once the input passes validation, even if the call fails later, so invalid input spends input bytes but no calls. The input budget limits how much serialized JSON an execution can hand to the Rust side, not the Rust heap or process RSS: parsed requests take more memory than their JSON, and requests waiting for an inference slot stay in memory until they run.
+
+Each execution runs on its own thread, so CPU-bound scripts don't delay MCP requests or inference responses. With `vcpu_per_execution`, the server measures each execution's thread CPU time and pauses it whenever it gets ahead of its share, so busy scripts use at most `max_concurrent_executions` × `vcpu_per_execution` CPUs in total. Time spent waiting on `system1.decide()` earns at most 10 ms of extra CPU, and a single native call, such as filling a large typed array, is only paused after it returns. To size a container, give it that much CPU plus some headroom for the server. For memory, start from about 60 MB + `max_concurrent_executions` × (`memory_limit_mb` + a few times `max_decision_input_total_mb`) and add headroom. This is an estimate, not a guaranteed upper bound: allocations outside QuickJS, such as parsed decision requests, HTTP buffers and responses, aren't capped.
 
 Some MCP clients, including Claude Code, run tool calls one at a time, so a single agent rarely reaches `max_concurrent_executions`. Put independent decisions in one script with `Promise.all` to use `max_concurrent_requests`.
 
@@ -241,7 +245,8 @@ A failed `system1.decide()` call rejects with a `System1Error` that has a `kind`
 | --- | --- |
 | `provider_not_configured` | no config file |
 | `invalid_input` | bad, unserializable or oversized input |
-| `call_limit_exceeded` | per-execution budget used up |
+| `call_limit_exceeded` | per-execution call budget used up |
+| `input_budget_exceeded` | per-execution decision input budget used up |
 | `authentication` | HTTP 401/403: check `api_key` |
 | `http`, `timeout`, `transport` | other HTTP, timeout or network failures |
 | `invalid_response` | response didn't match the questions |

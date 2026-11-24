@@ -10,3 +10,4 @@ memory_limit_mb = 64
 max_concurrent_requests = 8
 max_concurrent_executions = 4
 max_calls_per_execution = 32
+max_decision_input_total_mb = 8

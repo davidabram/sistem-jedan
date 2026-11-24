@@ -10,15 +10,13 @@ use crate::config::Provider;
 use crate::diagnostic;
 
 pub(super) const MAX_QUESTION_NAME_LEN: usize = 64;
-const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
+const PROBABILITY_TOLERANCE: f64 = 0.02;
 const MAX_ERROR_LABEL_BYTES: usize = 256;
-const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(super) const MIN_CHOICES: usize = 2;
 pub(super) const MIN_SCORE_LEVELS: usize = 2;
 pub(super) const MAX_NESTING_DEPTH: usize = 64;
 pub(super) const TRANSPORT_KIND: &str = "transport";
-const REDACTED: &str = "<redacted>";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,11 +165,19 @@ pub(super) enum ResponseError {
     ProbabilitySum { question: String, sum: f64 },
     #[error("question {question:?} answered with unknown choice {choice:?}")]
     UnknownChoice { question: String, choice: String },
+    #[error("question {question:?} chose {choice:?} although another choice is more probable")]
+    InconsistentChoice { question: String, choice: String },
     #[error("question {question:?} has score {score} outside 0 to {max}")]
     ScoreOutOfRange {
         question: String,
         score: f64,
         max: usize,
+    },
+    #[error("question {question:?} has score {score} but its probabilities imply {expected}")]
+    InconsistentScore {
+        question: String,
+        score: f64,
+        expected: f64,
     },
     #[error("question {question:?} refers to unknown level {level}")]
     UnknownLevel { question: String, level: String },
@@ -191,10 +197,10 @@ pub(super) enum DecisionsError {
     Transport(#[source] reqwest::Error),
     #[error("response body exceeds {MAX_RESPONSE_BYTES} bytes")]
     ResponseTooLarge,
-    #[error("authentication failed with HTTP {status}: {message}")]
-    Authentication { status: StatusCode, message: String },
-    #[error("Decisions API returned HTTP {status}: {message}")]
-    Http { status: StatusCode, message: String },
+    #[error("authentication failed with HTTP {0}")]
+    Authentication(StatusCode),
+    #[error("Decisions API returned HTTP {0}")]
+    Http(StatusCode),
     #[error("response is not a valid Decisions response: {0}")]
     Decode(#[source] serde_json::Error),
     #[error("invalid response: {0}")]
@@ -207,8 +213,8 @@ impl DecisionsError {
             Self::Build(_) | Self::InvalidApiKey => "configuration",
             Self::Timeout(_) => "timeout",
             Self::Transport(_) => TRANSPORT_KIND,
-            Self::Authentication { .. } => "authentication",
-            Self::Http { .. } => "http",
+            Self::Authentication(_) => "authentication",
+            Self::Http(_) => "http",
             Self::ResponseTooLarge | Self::Decode(_) | Self::InvalidResponse(_) => {
                 "invalid_response"
             }
@@ -229,34 +235,6 @@ struct Body<'a> {
     model: &'a str,
     state: &'a serde_json::Value,
     questions: &'a BTreeMap<String, Question>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ErrorBody {
-    Error { error: ErrorDetail },
-    Detail { detail: serde_json::Value },
-}
-
-impl ErrorBody {
-    fn into_message(self) -> String {
-        match self {
-            Self::Error { error } => error.message,
-            Self::Detail { detail } => match detail {
-                serde_json::Value::String(message) => message,
-                serde_json::Value::Object(ref fields) => fields
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .map_or_else(|| detail.to_string(), str::to_owned),
-                detail => detail.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct ErrorDetail {
-    message: String,
 }
 
 impl Client {
@@ -296,10 +274,15 @@ impl Client {
             .await
             .map_err(|error| self.transport(error))?;
         let status = response.status();
-        let bytes = self.read_body(response).await?;
         if !status.is_success() {
-            return Err(self.status_error(status, &bytes));
+            return Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    DecisionsError::Authentication(status)
+                }
+                _ => DecisionsError::Http(status),
+            });
         }
+        let bytes = self.read_body(response).await?;
         let response: Response = serde_json::from_slice(&bytes).map_err(DecisionsError::Decode)?;
         response
             .validate(request)
@@ -333,42 +316,6 @@ impl Client {
         } else {
             DecisionsError::Transport(error.without_url())
         }
-    }
-
-    fn status_error(&self, status: StatusCode, body: &[u8]) -> DecisionsError {
-        let message = serde_json::from_slice::<ErrorBody>(body).map_or_else(
-            |_| {
-                status
-                    .canonical_reason()
-                    .unwrap_or("unknown error")
-                    .to_owned()
-            },
-            |body| self.redact(&body.into_message()),
-        );
-        match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                DecisionsError::Authentication { status, message }
-            }
-            _ => DecisionsError::Http { status, message },
-        }
-    }
-
-    fn redact(&self, message: &str) -> String {
-        let Some(key) = std::str::from_utf8(self.authorization.as_bytes())
-            .ok()
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
-            return REDACTED.to_owned();
-        };
-        let mut chars = message.split(key).enumerate().flat_map(|(index, part)| {
-            let separator = if index == 0 { "" } else { REDACTED };
-            separator.chars().chain(part.chars())
-        });
-        let mut sanitized: String = chars.by_ref().take(MAX_ERROR_MESSAGE_CHARS).collect();
-        if chars.next().is_some() {
-            sanitized.push_str(diagnostic::TRUNCATED);
-        }
-        sanitized
     }
 }
 
@@ -570,7 +517,20 @@ fn validate_choice(
         {
             return Err(unknown(choice));
         }
-        distribution(name, probabilities.values().copied())?;
+        let sum = distribution(name, probabilities.values().copied())?;
+        let chosen = probabilities
+            .get(&answer.choice)
+            .copied()
+            .unwrap_or((1.0 - sum).max(0.0));
+        if probabilities
+            .values()
+            .any(|&probability| probability - chosen > PROBABILITY_TOLERANCE)
+        {
+            return Err(ResponseError::InconsistentChoice {
+                question: name.to_owned(),
+                choice: diagnostic::truncate(&answer.choice, MAX_ERROR_LABEL_BYTES),
+            });
+        }
     }
     Ok(())
 }
@@ -600,7 +560,26 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         });
     }
     if let Some(probabilities) = &answer.probabilities {
-        distribution(name, probabilities.values().copied())?;
+        let sum = distribution(name, probabilities.values().copied())?;
+        let expected: f64 = probabilities
+            .iter()
+            .filter_map(|(level, probability)| {
+                level
+                    .parse::<u32>()
+                    .ok()
+                    .map(|level| f64::from(level) * probability)
+            })
+            .sum();
+        let highest = f64::from(u32::try_from(max).unwrap_or(u32::MAX));
+        let tolerance = PROBABILITY_TOLERANCE * highest;
+        let unlisted = (1.0 - sum).max(0.0) * highest;
+        if answer.score < expected - tolerance || answer.score > expected + unlisted + tolerance {
+            return Err(ResponseError::InconsistentScore {
+                question: name.to_owned(),
+                score: answer.score,
+                expected,
+            });
+        }
     }
     Ok(())
 }
@@ -620,14 +599,14 @@ fn confidence(name: &str, value: Option<f64>) -> Result<(), ResponseError> {
     value.map_or(Ok(()), |value| probability(name, value))
 }
 
-fn distribution(name: &str, values: impl Iterator<Item = f64>) -> Result<(), ResponseError> {
+fn distribution(name: &str, values: impl Iterator<Item = f64>) -> Result<f64, ResponseError> {
     let mut sum = 0.0;
     for value in values {
         probability(name, value)?;
         sum += value;
     }
-    if (sum - 1.0).abs() <= PROBABILITY_SUM_TOLERANCE {
-        Ok(())
+    if (sum - 1.0).abs() <= PROBABILITY_TOLERANCE {
+        Ok(sum)
     } else {
         Err(ResponseError::ProbabilitySum {
             question: name.to_owned(),

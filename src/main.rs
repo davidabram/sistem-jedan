@@ -83,6 +83,8 @@ async fn serve() -> Result<(), Error> {
         max_concurrent_requests = execution.max_concurrent_requests,
         max_concurrent_executions = execution.max_concurrent_executions,
         max_calls_per_execution = execution.max_calls_per_execution,
+        max_decision_input_bytes = js::MAX_DECISION_INPUT_BYTES,
+        max_decision_input_total_bytes = execution.max_decision_input_total.get(),
         "execution limits"
     );
     let server = mcp::Server::new(execution, client);
