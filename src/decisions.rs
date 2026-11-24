@@ -11,8 +11,9 @@ use crate::diagnostic;
 
 pub(super) const MAX_QUESTION_NAME_LEN: usize = 64;
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
-const CHOICE_TOLERANCE: f64 = 1e-9;
-const SCORE_TOLERANCE: f64 = 0.01;
+const ROUNDING_TOLERANCE: f64 = 0.005;
+const FLOAT_TOLERANCE: f64 = 1e-9;
+const CHOICE_TOLERANCE: f64 = 2.0 * ROUNDING_TOLERANCE + FLOAT_TOLERANCE;
 const MAX_ERROR_LABEL_BYTES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(super) const MIN_CHOICES: usize = 2;
@@ -547,10 +548,11 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         });
     }
     confidence(name, answer.confidence)?;
-    let expected = answer.probabilities.iter().flatten().try_fold(
-        0.0,
-        |expected: f64, (key, probability)| -> Result<f64, ResponseError> {
-            Ok(expected + level(name, key, levels)? * probability)
+    let (expected, listed_levels) = answer.probabilities.iter().flatten().try_fold(
+        (0.0, 0.0),
+        |(expected, listed): (f64, f64), (key, probability)| -> Result<_, ResponseError> {
+            let level = level(name, key, levels)?;
+            Ok((expected + level * probability, listed + level))
         },
     )?;
     for key in answer.legend.iter().flat_map(BTreeMap::keys) {
@@ -561,8 +563,9 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         let highest = f64::from(u32::try_from(max).unwrap_or(u32::MAX));
         let missing_mass = (1.0 - sum).max(0.0);
         let excess_mass = (sum - 1.0).max(0.0);
-        let lower = expected - excess_mass * highest - SCORE_TOLERANCE;
-        let upper = expected + missing_mass * highest + SCORE_TOLERANCE;
+        let tolerance = ROUNDING_TOLERANCE * (1.0 + listed_levels) + FLOAT_TOLERANCE;
+        let lower = expected - excess_mass * highest - tolerance;
+        let upper = expected + missing_mass * highest + tolerance;
         if !(lower..=upper).contains(&answer.score) {
             return Err(ResponseError::InconsistentScore {
                 question: name.to_owned(),

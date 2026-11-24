@@ -151,12 +151,12 @@ return {
 
 Score probability and legend keys use canonical decimal levels such as `"0"` and `"1"`. Sparse maps are allowed. Probability maps must sum to 1 within 0.02. Responses are also checked for internal consistency:
 
-- A `choice` must be at least as probable as every other listed choice. Ties are accepted. If the chosen id is missing from a sparse map, no listed choice may be more probable than the mass left unlisted.
-- A `score` must be within 0.01 score units of the probability-weighted level of its `probabilities`. If the map sums to less or more than 1, the allowed range widens by the missing or excess mass times the highest level.
+- A `choice` must be at least as probable as every other listed choice, within 0.01. Ties are accepted. If the chosen id is missing from a sparse map, no listed choice may be more probable than the mass left unlisted.
+- A `score` must be within `0.005 × (1 + sum of listed levels)` score units of the probability-weighted level of its `probabilities`. If the map sums to less or more than 1, the allowed range widens by the missing or excess mass times the highest level.
 
 Responses that fail validation reject with `invalid_response`. The server never corrects or renormalizes a response.
 
-These tolerances are this server's own policy. OpenRouter doesn't document how providers round probabilities or scores. A provider that rounds each probability and the score independently, for example to two decimals, can be off by more than 0.01 on scales with many levels. Such a response is rejected even though it is otherwise legitimate.
+These tolerances are this server's own policy. OpenRouter doesn't document how providers round probabilities or scores. They are sized so that a provider rounding each probability and the score independently to two decimals still passes. Coarser rounding can be rejected even though the response is otherwise legitimate.
 
 ## Configuration
 
