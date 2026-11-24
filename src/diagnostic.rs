@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 
 pub(super) const MAX_BYTES: usize = 8 * 1024;
-const TRUNCATED: &str = "… [truncated]";
+pub(super) const TRUNCATED: &str = "… [truncated]";
 
 pub(super) fn message(value: impl fmt::Display) -> String {
     let mut output = Diagnostic(String::new());

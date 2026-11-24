@@ -149,7 +149,7 @@ return {
 };
 ```
 
-Responses that don't match your questions reject with `invalid_response`.
+Score probability and legend keys use canonical decimal levels such as `"0"` and `"1"`. Sparse maps are allowed. Responses that fail validation reject with `invalid_response`.
 
 ## Configuration
 
@@ -196,7 +196,7 @@ The memory limit counts live QuickJS backing allocations, including runtime init
 
 ## Errors
 
-An execution ends when the returned promise settles, the deadline expires, the runtime runs out of memory, or MCP cancels the request. Every deadline expiration is `timeout`, including when the returned promise stays pending. Execution diagnostics are limited to 8 KiB of UTF-8.
+An execution ends when the returned promise settles, the deadline expires, the runtime runs out of memory, or MCP cancels the request. Every deadline expiration is `timeout`, including when the returned promise stays pending. A backing allocation failure ends the execution even if JavaScript catches the resulting exception. Execution diagnostics are limited to 8 KiB of UTF-8.
 
 - If the code returns nothing, it fails with `missing_return`. If the return value can't be converted to JSON, it fails with `unsupported_result`.
 - A rejection that propagates through the returned promise fails with `exception`.

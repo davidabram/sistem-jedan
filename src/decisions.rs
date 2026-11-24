@@ -7,26 +7,29 @@ use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Provider;
+use crate::diagnostic;
 
-const MAX_QUESTION_NAME_LEN: usize = 64;
+pub(super) const MAX_QUESTION_NAME_LEN: usize = 64;
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
+const MAX_ERROR_LABEL_BYTES: usize = 256;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const MIN_CHOICES: usize = 2;
-const MIN_SCORE_LEVELS: usize = 2;
-const MAX_NESTING_DEPTH: usize = 64;
+pub(super) const MIN_CHOICES: usize = 2;
+pub(super) const MIN_SCORE_LEVELS: usize = 2;
+pub(super) const MAX_NESTING_DEPTH: usize = 64;
+pub(super) const TRANSPORT_KIND: &str = "transport";
 const REDACTED: &str = "<redacted>";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Request {
-    pub state: serde_json::Value,
-    pub questions: BTreeMap<String, Question>,
+struct Request {
+    state: serde_json::Value,
+    questions: BTreeMap<String, Question>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-pub enum Question {
+enum Question {
     Noul {
         #[serde(skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
@@ -45,81 +48,83 @@ pub enum Question {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NoulCriteria {
+struct NoulCriteria {
     #[serde(rename = "true")]
-    pub yes: String,
+    yes: String,
     #[serde(rename = "false")]
-    pub no: String,
+    no: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Response {
-    pub id: Option<String>,
-    pub model: String,
-    pub provider: Option<String>,
-    pub answers: BTreeMap<String, Answer>,
-    pub usage: Usage,
+#[derive(Serialize, Deserialize)]
+pub(super) struct Response {
+    id: Option<String>,
+    model: String,
+    provider: Option<String>,
+    answers: BTreeMap<String, Answer>,
+    usage: Usage,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub enum Answer {
+enum Answer {
     Noul(NoulAnswer),
     Choice(ChoiceAnswer),
     Score(ScoreAnswer),
     Refusal,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NoulAnswer {
-    pub noul: f64,
-    pub confidence: Option<f64>,
+#[derive(Serialize, Deserialize)]
+struct NoulAnswer {
+    noul: f64,
+    confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChoiceAnswer {
-    pub choice: String,
-    pub probabilities: Option<BTreeMap<String, f64>>,
-    pub confidence: Option<f64>,
+#[derive(Serialize, Deserialize)]
+struct ChoiceAnswer {
+    choice: String,
+    probabilities: Option<BTreeMap<String, f64>>,
+    confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScoreAnswer {
-    pub score: f64,
-    pub probabilities: Option<BTreeMap<String, f64>>,
-    pub legend: Option<BTreeMap<String, String>>,
-    pub confidence: Option<f64>,
+#[derive(Serialize, Deserialize)]
+struct ScoreAnswer {
+    score: f64,
+    probabilities: Option<BTreeMap<String, f64>>,
+    legend: Option<BTreeMap<String, String>>,
+    confidence: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost: Option<f64>,
-    pub input_tokens_details: Option<InputTokensDetails>,
-    pub cost_details: Option<CostDetails>,
-    pub is_byok: Option<bool>,
+#[derive(Serialize, Deserialize)]
+struct Usage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cost: Option<f64>,
+    input_tokens_details: Option<InputTokensDetails>,
+    cost_details: Option<CostDetails>,
+    is_byok: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InputTokensDetails {
-    pub cached_tokens: Option<u64>,
+#[derive(Serialize, Deserialize)]
+struct InputTokensDetails {
+    cached_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CostDetails {
+#[derive(Serialize, Deserialize)]
+struct CostDetails {
     #[serde(rename = "upstream_inference_cost")]
-    pub upstream: Option<f64>,
+    upstream: Option<f64>,
     #[serde(rename = "upstream_inference_prompt_cost")]
-    pub upstream_prompt: Option<f64>,
+    upstream_prompt: Option<f64>,
     #[serde(rename = "upstream_inference_completions_cost")]
-    pub upstream_completions: Option<f64>,
+    upstream_completions: Option<f64>,
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
-pub enum RequestError {
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RequestError {
+    #[error(transparent)]
+    Decode(#[from] serde_json::Error),
     #[error("at least one question is required")]
     NoQuestions,
     #[error(
@@ -140,8 +145,8 @@ pub enum RequestError {
     EmptyCriterion { question: String, criterion: String },
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
-pub enum ResponseError {
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ResponseError {
     #[error("model is empty")]
     EmptyModel,
     #[error("no answer for question {0:?}")]
@@ -173,13 +178,11 @@ pub enum ResponseError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum DecisionsError {
+pub(super) enum DecisionsError {
     #[error("failed to build HTTP client: {0}")]
     Build(#[source] reqwest::Error),
     #[error("provider.api_key is not a valid HTTP header value")]
     InvalidApiKey,
-    #[error("invalid request: {0}")]
-    InvalidRequest(#[from] RequestError),
     #[error("request timed out after {}ms", .0.as_millis())]
     Timeout(Duration),
     #[error("HTTP request failed: {0}")]
@@ -193,17 +196,15 @@ pub enum DecisionsError {
     #[error("response is not a valid Decisions response: {0}")]
     Decode(#[source] serde_json::Error),
     #[error("invalid response: {0}")]
-    InvalidResponse(#[from] ResponseError),
+    InvalidResponse(#[source] ResponseError),
 }
 
 impl DecisionsError {
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub(super) fn kind(&self) -> &'static str {
         match self {
             Self::Build(_) | Self::InvalidApiKey => "configuration",
-            Self::InvalidRequest(_) => "invalid_input",
             Self::Timeout(_) => "timeout",
-            Self::Transport(_) => "transport",
+            Self::Transport(_) => TRANSPORT_KIND,
             Self::Authentication { .. } => "authentication",
             Self::Http { .. } => "http",
             Self::ResponseTooLarge | Self::Decode(_) | Self::InvalidResponse(_) => {
@@ -213,8 +214,7 @@ impl DecisionsError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Client {
+pub(super) struct Client {
     http: reqwest::Client,
     endpoint: Url,
     model: String,
@@ -240,10 +240,9 @@ struct ErrorDetail {
 }
 
 impl Client {
-    pub fn new(provider: &Provider, timeout: Duration) -> Result<Self, DecisionsError> {
-        let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {}", provider.api_key.expose()))
-                .map_err(|_| DecisionsError::InvalidApiKey)?;
+    pub(super) fn new(provider: Provider, timeout: Duration) -> Result<Self, DecisionsError> {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", provider.api_key()))
+            .map_err(|_| DecisionsError::InvalidApiKey)?;
         authorization.set_sensitive(true);
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -252,18 +251,21 @@ impl Client {
             .map_err(DecisionsError::Build)?;
         Ok(Self {
             http,
-            endpoint: provider.endpoint.clone(),
-            model: provider.model.clone(),
+            endpoint: provider.endpoint,
+            model: provider.model,
             authorization,
             timeout,
         })
     }
 
-    pub async fn decide(&self, request: &Request) -> Result<Response, DecisionsError> {
+    pub(super) async fn decide(
+        &self,
+        request: &ValidatedRequest,
+    ) -> Result<Response, DecisionsError> {
         let body = Body {
             model: &self.model,
-            state: &request.state,
-            questions: &request.questions,
+            state: &request.0.state,
+            questions: &request.0.questions,
         };
         let response = self
             .http
@@ -279,7 +281,9 @@ impl Client {
             return Err(self.status_error(status, &bytes));
         }
         let response: Response = serde_json::from_slice(&bytes).map_err(DecisionsError::Decode)?;
-        response.validate(request)?;
+        response
+            .validate(request)
+            .map_err(DecisionsError::InvalidResponse)?;
         Ok(response)
     }
 
@@ -330,25 +334,36 @@ impl Client {
     }
 
     fn redact(&self, message: &str) -> String {
-        let mut sanitized = match self
-            .authorization
-            .to_str()
+        let Some(key) = std::str::from_utf8(self.authorization.as_bytes())
             .ok()
             .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|key| !key.is_empty())
-        {
-            Some(key) => message.replace(key, REDACTED),
-            None => message.to_owned(),
+        else {
+            return REDACTED.to_owned();
         };
-        if let Some((end, _)) = sanitized.char_indices().nth(MAX_ERROR_MESSAGE_CHARS) {
-            sanitized.truncate(end);
+        let mut chars = message.split(key).enumerate().flat_map(|(index, part)| {
+            let separator = if index == 0 { "" } else { REDACTED };
+            separator.chars().chain(part.chars())
+        });
+        let mut sanitized: String = chars.by_ref().take(MAX_ERROR_MESSAGE_CHARS).collect();
+        if chars.next().is_some() {
+            sanitized.push_str(diagnostic::TRUNCATED);
         }
         sanitized
     }
 }
 
+pub(super) struct ValidatedRequest(Request);
+
+impl ValidatedRequest {
+    pub(super) fn from_json(bytes: &[u8]) -> Result<Self, RequestError> {
+        let request: Request = serde_json::from_slice(bytes)?;
+        request.validate()?;
+        Ok(Self(request))
+    }
+}
+
 impl Request {
-    pub fn validate(&self) -> Result<(), RequestError> {
+    fn validate(&self) -> Result<(), RequestError> {
         if !matches!(
             self.state,
             serde_json::Value::String(_)
@@ -365,7 +380,10 @@ impl Request {
         }
         for (name, question) in &self.questions {
             if !is_valid_question_name(name) {
-                return Err(RequestError::InvalidQuestionName(name.clone()));
+                return Err(RequestError::InvalidQuestionName(diagnostic::truncate(
+                    name,
+                    MAX_ERROR_LABEL_BYTES,
+                )));
             }
             question.validate(name)?;
         }
@@ -374,6 +392,14 @@ impl Request {
 }
 
 impl Question {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Noul { .. } => "noul",
+            Self::Choice { .. } => "choice",
+            Self::Score { .. } => "score",
+        }
+    }
+
     fn validate(&self, name: &str) -> Result<(), RequestError> {
         let (Self::Noul { instructions, .. }
         | Self::Choice { instructions, .. }
@@ -383,7 +409,7 @@ impl Question {
         }
         let empty = |criterion: &str| RequestError::EmptyCriterion {
             question: name.to_owned(),
-            criterion: criterion.to_owned(),
+            criterion: diagnostic::truncate(criterion, MAX_ERROR_LABEL_BYTES),
         };
         match self {
             Self::Noul { criteria, .. } => {
@@ -440,20 +466,8 @@ fn is_valid_question_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
-impl Question {
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Noul { .. } => "noul",
-            Self::Choice { .. } => "choice",
-            Self::Score { .. } => "score",
-        }
-    }
-}
-
 impl Answer {
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
+    fn kind(&self) -> &'static str {
         match self {
             Self::Noul(_) => "noul",
             Self::Choice(_) => "choice",
@@ -464,7 +478,7 @@ impl Answer {
 }
 
 impl Response {
-    pub fn validate(&self, request: &Request) -> Result<(), ResponseError> {
+    fn validate(&self, request: &ValidatedRequest) -> Result<(), ResponseError> {
         if self.model.trim().is_empty() {
             return Err(ResponseError::EmptyModel);
         }
@@ -478,11 +492,14 @@ impl Response {
         if let Some(name) = self
             .answers
             .keys()
-            .find(|name| !request.questions.contains_key(*name))
+            .find(|name| !request.0.questions.contains_key(*name))
         {
-            return Err(ResponseError::UnexpectedAnswer(name.clone()));
+            return Err(ResponseError::UnexpectedAnswer(diagnostic::truncate(
+                name,
+                MAX_ERROR_LABEL_BYTES,
+            )));
         }
-        for (name, question) in &request.questions {
+        for (name, question) in &request.0.questions {
             let answer = self
                 .answers
                 .get(name)
@@ -519,7 +536,7 @@ fn validate_choice(
 ) -> Result<(), ResponseError> {
     let unknown = |choice: &String| ResponseError::UnknownChoice {
         question: name.to_owned(),
-        choice: choice.clone(),
+        choice: diagnostic::truncate(choice, MAX_ERROR_LABEL_BYTES),
     };
     if !criteria.contains_key(&answer.choice) {
         return Err(unknown(&answer.choice));
@@ -552,12 +569,13 @@ fn validate_score(name: &str, levels: usize, answer: &ScoreAnswer) -> Result<(),
         .iter()
         .flat_map(BTreeMap::keys)
         .chain(answer.legend.iter().flat_map(BTreeMap::keys));
-    if let Some(level) =
-        keys.find(|level| level.parse::<usize>().map_or(true, |level| level >= levels))
-    {
+    if let Some(level) = keys.find(|key| {
+        !matches!(key.as_bytes(), [b'0'] | [b'1'..=b'9', ..])
+            || !key.parse::<usize>().is_ok_and(|level| level < levels)
+    }) {
         return Err(ResponseError::UnknownLevel {
             question: name.to_owned(),
-            level: level.clone(),
+            level: diagnostic::truncate(level, MAX_ERROR_LABEL_BYTES),
         });
     }
     if let Some(probabilities) = &answer.probabilities {

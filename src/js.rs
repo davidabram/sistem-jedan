@@ -10,35 +10,40 @@ use rquickjs::{
 };
 use tokio::sync::Semaphore;
 
-use crate::decisions::{self, DecisionsError, Request};
+use crate::config::BYTES_PER_MIB;
+use crate::decisions::{self, DecisionsError, RequestError, ValidatedRequest};
 use crate::diagnostic;
 use crate::memory::LimitedAllocator;
 
+pub(super) const TIMEOUT_KIND: &str = "timeout";
+pub(super) const INVALID_INPUT_KIND: &str = "invalid_input";
+pub(super) const CALL_LIMIT_KIND: &str = "call_limit_exceeded";
+pub(super) const PROVIDER_NOT_CONFIGURED_KIND: &str = "provider_not_configured";
+pub(super) const OUT_OF_MEMORY_KIND: &str = "out_of_memory";
 const STACK_LIMIT: usize = 512 * 1024;
-const SYSTEM1_ERROR: &str = "System1Error";
-pub const MAX_DECISION_INPUT_BYTES: usize = 1024 * 1024;
-pub const MAX_EXECUTE_RESULT_BYTES: usize = 1024 * 1024;
+pub(super) const SYSTEM1_ERROR: &str = "System1Error";
+pub(super) const MAX_DECISION_INPUT_BYTES: usize = BYTES_PER_MIB;
+pub(super) const MAX_EXECUTE_RESULT_BYTES: usize = BYTES_PER_MIB;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    pub timeout: Duration,
-    pub memory_limit: usize,
+#[derive(Clone, Copy)]
+pub(super) struct Limits {
+    pub(super) timeout: Duration,
+    pub(super) memory_limit: usize,
 }
 
-#[derive(Debug)]
-pub struct System1 {
+pub(super) struct System1 {
     client: Option<decisions::Client>,
     permits: Semaphore,
     max_calls: NonZeroU32,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum JsError {
+pub(super) enum JsError {
     #[error("{0}")]
     Exception(String),
     #[error("execution exceeded the {}ms deadline", .0.as_millis())]
     Timeout(Duration),
-    #[error("execution exceeded the {0} byte memory limit")]
+    #[error("JavaScript allocation failed with a {0} byte execution memory limit")]
     OutOfMemory(usize),
     #[error("no value returned; use an explicit top-level `return`")]
     MissingReturn,
@@ -63,9 +68,9 @@ enum DecideError {
     #[error("serialized decision input exceeds the {MAX_DECISION_INPUT_BYTES} byte limit")]
     InputTooLarge,
     #[error("invalid decision input: {0}")]
-    InvalidInput(#[source] serde_json::Error),
+    InvalidInput(#[from] RequestError),
     #[error(transparent)]
-    Decisions(#[from] DecisionsError),
+    Decisions(DecisionsError),
     #[error("failed to encode the decision response: {0}")]
     Encode(#[source] serde_json::Error),
     #[error("the inference request limiter is closed")]
@@ -74,11 +79,11 @@ enum DecideError {
 
 impl JsError {
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub(super) const fn kind(&self) -> &'static str {
         match self {
             Self::Exception(_) => "exception",
-            Self::Timeout(_) => "timeout",
-            Self::OutOfMemory(_) => "out_of_memory",
+            Self::Timeout(_) => TIMEOUT_KIND,
+            Self::OutOfMemory(_) => OUT_OF_MEMORY_KIND,
             Self::MissingReturn => "missing_return",
             Self::UnsupportedResult(_) => "unsupported_result",
             Self::ResultTooLarge => "result_too_large",
@@ -91,14 +96,14 @@ impl JsError {
 impl DecideError {
     fn kind(&self) -> &'static str {
         match self {
-            Self::ProviderNotConfigured => "provider_not_configured",
-            Self::CallLimitExceeded(_) => "call_limit_exceeded",
+            Self::ProviderNotConfigured => PROVIDER_NOT_CONFIGURED_KIND,
+            Self::CallLimitExceeded(_) => CALL_LIMIT_KIND,
             Self::Unserializable(_) | Self::InputTooLarge | Self::InvalidInput(_) => {
-                "invalid_input"
+                INVALID_INPUT_KIND
             }
             Self::Decisions(error) => error.kind(),
             Self::Encode(_) => "encode",
-            Self::LimiterClosed => "limiter_closed",
+            Self::LimiterClosed => decisions::TRANSPORT_KIND,
         }
     }
 
@@ -120,7 +125,7 @@ impl DecideError {
 
 impl System1 {
     #[must_use]
-    pub fn new(
+    pub(super) fn new(
         client: Option<decisions::Client>,
         max_concurrent_requests: usize,
         max_calls: NonZeroU32,
@@ -132,19 +137,17 @@ impl System1 {
         }
     }
 
-    #[must_use]
-    pub fn max_calls(&self) -> NonZeroU32 {
-        self.max_calls
-    }
-
     fn prepare<'js>(
         &self,
         ctx: &Ctx<'js>,
         input: Value<'js>,
         remaining: &Cell<u32>,
-    ) -> Result<Request, DecideError> {
+    ) -> Result<ValidatedRequest, DecideError> {
         if self.client.is_none() {
             return Err(DecideError::ProviderNotConfigured);
+        }
+        if remaining.get() == 0 {
+            return Err(DecideError::CallLimitExceeded(self.max_calls));
         }
         let json = match ctx.json_stringify(input) {
             Ok(Some(json)) => json.to_cstring(),
@@ -159,9 +162,7 @@ impl System1 {
         if json.len() > MAX_DECISION_INPUT_BYTES {
             return Err(DecideError::InputTooLarge);
         }
-        let request: Request =
-            serde_json::from_slice(c_bytes(&json)).map_err(DecideError::InvalidInput)?;
-        request.validate().map_err(DecisionsError::from)?;
+        let request = ValidatedRequest::from_json(c_bytes(&json))?;
         let left = remaining
             .get()
             .checked_sub(1)
@@ -170,21 +171,35 @@ impl System1 {
         Ok(request)
     }
 
-    async fn decide(&self, request: &Request) -> Result<String, DecideError> {
+    async fn decide<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        request: &ValidatedRequest,
+        execution: &Execution,
+    ) -> rquickjs::Result<Value<'js>> {
         let client = self
             .client
             .as_ref()
-            .ok_or(DecideError::ProviderNotConfigured)?;
-        let _permit = self
+            .ok_or_else(|| DecideError::ProviderNotConfigured.throw(ctx))?;
+        let permit = self
             .permits
             .acquire()
             .await
-            .map_err(|_| DecideError::LimiterClosed)?;
-        let response = client.decide(request).await?;
-        serde_json::to_string(&response).map_err(DecideError::Encode)
+            .map_err(|_| DecideError::LimiterClosed.throw(ctx))?;
+        execution.check()?;
+        let response = client
+            .decide(request)
+            .await
+            .map_err(|error| DecideError::Decisions(error).throw(ctx))?;
+        drop(permit);
+        execution.check()?;
+        let json = serde_json::to_string(&response)
+            .map_err(|error| DecideError::Encode(error).throw(ctx))?;
+        ctx.json_parse(json)
     }
 }
 
+#[derive(Clone)]
 struct Execution {
     deadline: Instant,
     limits: Limits,
@@ -192,6 +207,14 @@ struct Execution {
 }
 
 impl Execution {
+    fn check(&self) -> rquickjs::Result<()> {
+        self.failure()
+            .map_or(Ok(()), |_| Err(rquickjs::Error::Unknown))
+    }
+
+    /// A backing allocation failure ends the execution. `QuickJS` can throw
+    /// an ordinary JavaScript Error on exhaustion and exposes no reliable tag
+    /// that distinguishes it from a later user exception.
     fn failure(&self) -> Option<JsError> {
         if Instant::now() >= self.deadline {
             Some(JsError::Timeout(self.limits.timeout))
@@ -222,7 +245,7 @@ impl Execution {
     }
 }
 
-pub async fn run(
+pub(super) async fn run(
     code: &str,
     limits: Limits,
     system1: Arc<System1>,
@@ -230,15 +253,15 @@ pub async fn run(
 ) -> Result<serde_json::Value, JsError> {
     let deadline = Instant::now() + limits.timeout;
     let (allocator, allocation_failed) = LimitedAllocator::new(limits.memory_limit);
-    let execution = Arc::new(Execution {
+    let execution = Execution {
         deadline,
         limits,
         allocation_failed,
-    });
+    };
     let runtime = AsyncRuntime::new_with_alloc(allocator)
         .map_err(|error| execution.classify(error, None, None))?;
     runtime.set_max_stack_size(STACK_LIMIT).await;
-    let interrupt = Arc::clone(&execution);
+    let interrupt = execution.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
             cancelled() || interrupt.failure().is_some()
@@ -253,7 +276,7 @@ pub async fn run(
             .eval("Object.getOwnPropertyDescriptor(Error.prototype, 'stack').get")
             .map_err(|error| execution.classify(error, Some(&ctx), None))?;
         let classify = |error| execution.classify(error, Some(&ctx), Some(&stack));
-        install(&ctx, system1, Arc::clone(&execution)).map_err(classify)?;
+        install(&ctx, system1, execution.clone()).map_err(classify)?;
         let promise = ctx.eval::<Promise, _>(source).map_err(classify)?;
         let value = promise.into_future::<Value>().await.map_err(classify)?;
         to_json(&ctx, value, classify)
@@ -275,7 +298,7 @@ pub async fn run(
 fn install<'js>(
     ctx: &Ctx<'js>,
     system1: Arc<System1>,
-    execution: Arc<Execution>,
+    execution: Execution,
 ) -> rquickjs::Result<()> {
     let remaining = Cell::new(system1.max_calls.get());
     let decide = Function::new(
@@ -283,17 +306,11 @@ fn install<'js>(
         Async(move |ctx: Ctx<'js>, input: Value<'js>| {
             let request = system1.prepare(&ctx, input, &remaining);
             let system1 = Arc::clone(&system1);
-            let execution = Arc::clone(&execution);
+            let execution = execution.clone();
             async move {
-                if execution.failure().is_some() {
-                    return Err(rquickjs::Error::Unknown);
-                }
+                execution.check()?;
                 let request = request.map_err(|error| error.throw(&ctx))?;
-                let response = system1
-                    .decide(&request)
-                    .await
-                    .map_err(|error| error.throw(&ctx))?;
-                ctx.json_parse(response)
+                system1.decide(&ctx, &request, &execution).await
             }
         }),
     )?
@@ -338,8 +355,9 @@ fn quickjs_message(ctx: &Ctx<'_>, error: &rquickjs::Error) -> String {
 
 fn describe_exception<'js>(value: &Value<'js>, stack_getter: Option<&Function<'js>>) -> String {
     if value.is_error() {
-        let name =
-            error_property(value, qjs::JS_ATOM_name, 256).unwrap_or_else(|| "Error".to_owned());
+        let name = error_property(value, qjs::JS_ATOM_name, 256)
+            .or_else(|| inherited_error_name(value))
+            .unwrap_or_else(|| "Error".to_owned());
         let message = error_property(value, qjs::JS_ATOM_message, 3 * 1024).unwrap_or_default();
         let stack = error_property(value, qjs::JS_ATOM_stack, 4 * 1024)
             .or_else(|| {
@@ -369,12 +387,24 @@ fn describe_exception<'js>(value: &Value<'js>, stack_getter: Option<&Function<'j
     format!("Uncaught {text}")
 }
 
+/// Only ordinary prototypes are inspected. Comparing class IDs of the live
+/// prototype and global object neither reads properties nor invokes a trap.
+fn inherited_error_name(value: &Value<'_>) -> Option<String> {
+    let prototype = value.as_object()?.get_prototype()?;
+    let global = value.ctx().globals();
+    if unsafe { qjs::JS_GetClassID(prototype.as_raw()) != qjs::JS_GetClassID(global.as_raw()) } {
+        return None;
+    }
+    error_property(prototype.as_value(), qjs::JS_ATOM_name, 256)
+}
+
+/// Reads a predefined own property of a native Error or an ordinary object.
+/// A positive result initializes the descriptor and transfers all three
+/// value references from the same context. Accessor functions are only freed.
 fn error_property(value: &Value<'_>, key: qjs::JSAtom, budget: usize) -> Option<String> {
     let ctx = value.ctx();
     let raw = ctx.as_raw().as_ptr();
     let mut descriptor = std::mem::MaybeUninit::uninit();
-    // SAFETY: The caller supplies a native Error from this context and a predefined atom.
-    // A positive return initializes the descriptor and transfers its three value references.
     let property = unsafe {
         match qjs::JS_GetOwnProperty(raw, descriptor.as_mut_ptr(), value.as_raw(), key) {
             ..=-1 => {
@@ -385,7 +415,6 @@ fn error_property(value: &Value<'_>, key: qjs::JSAtom, budget: usize) -> Option<
             _ => descriptor.assume_init(),
         }
     };
-    // SAFETY: All three references are owned results from the same context.
     let property_value = unsafe {
         qjs::JS_FreeValue(raw, property.getter);
         qjs::JS_FreeValue(raw, property.setter);
@@ -407,7 +436,7 @@ fn string_preview(value: &Value<'_>, budget: usize) -> Option<String> {
     ))
 }
 
+/// Reads only the initialized bytes of the buffer retained by `CString`.
 fn c_bytes<'a>(text: &'a CString<'_>) -> &'a [u8] {
-    // SAFETY: CString owns the QuickJS buffer of len() bytes for the duration of this borrow.
     unsafe { std::slice::from_raw_parts(text.as_ptr().cast(), text.len()) }
 }

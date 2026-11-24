@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::io;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -13,21 +12,11 @@ use crate::js::Limits;
 
 const APP_DIR: &str = "sistem-jedan";
 const CONFIG_FILE: &str = "config.toml";
-const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
-const DEFAULT_MEMORY_LIMIT_MB: u64 = 64;
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "64 MiB fits in usize on every supported platform"
-)]
-const DEFAULT_MEMORY_LIMIT_BYTES: usize = (DEFAULT_MEMORY_LIMIT_MB * BYTES_PER_MB) as usize;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
-const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
-const DEFAULT_MAX_CALLS_PER_EXECUTION: u32 = 32;
-const BYTES_PER_MB: u64 = 1024 * 1024;
+pub(super) const BYTES_PER_MIB: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
+pub(super) enum ConfigError {
     #[error("missing value for --config")]
     MissingConfigValue,
     #[error("--config given more than once")]
@@ -72,57 +61,45 @@ pub enum ConfigError {
     InvalidMaxCallsPerExecution,
 }
 
-pub struct ApiKey(String);
+pub(super) struct Provider {
+    pub(super) endpoint: Url,
+    pub(super) model: String,
+    api_key: String,
+}
 
-impl ApiKey {
-    pub fn expose(&self) -> &str {
-        &self.0
+impl Provider {
+    pub(super) fn api_key(&self) -> &str {
+        &self.api_key
     }
 }
 
-impl fmt::Debug for ApiKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ApiKey(<redacted>)")
-    }
-}
-
-#[derive(Debug)]
-pub struct Provider {
-    pub endpoint: Url,
-    pub model: String,
-    pub api_key: ApiKey,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ExecutionSettings {
-    pub limits: Limits,
-    pub max_concurrent_requests: usize,
-    pub max_concurrent_executions: usize,
-    pub max_calls_per_execution: NonZeroU32,
+pub(super) struct ExecutionSettings {
+    pub(super) limits: Limits,
+    pub(super) max_concurrent_requests: usize,
+    pub(super) max_concurrent_executions: usize,
+    pub(super) max_calls_per_execution: NonZeroU32,
 }
 
 impl ExecutionSettings {
-    pub const DEFAULT: Self = Self {
+    const DEFAULT: Self = Self {
         limits: Limits {
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
-            memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
+            timeout: Duration::from_secs(5),
+            memory_limit: 64 * BYTES_PER_MIB,
         },
-        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
-        max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
-        max_calls_per_execution: NonZeroU32::new(DEFAULT_MAX_CALLS_PER_EXECUTION).unwrap(),
+        max_concurrent_requests: 8,
+        max_concurrent_executions: 4,
+        max_calls_per_execution: NonZeroU32::new(32).unwrap(),
     };
 }
 
-#[derive(Debug)]
-pub struct ConfigFile {
-    pub path: PathBuf,
-    pub provider: Provider,
+pub(super) struct ConfigFile {
+    pub(super) path: PathBuf,
+    pub(super) provider: Provider,
 }
 
-#[derive(Debug)]
-pub struct Config {
-    pub file: Option<ConfigFile>,
-    pub execution: ExecutionSettings,
+pub(super) struct Config {
+    pub(super) file: Option<ConfigFile>,
+    pub(super) execution: ExecutionSettings,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +122,7 @@ struct RawProvider {
 #[serde(deny_unknown_fields, default)]
 struct RawExecution {
     timeout_seconds: u64,
-    memory_limit_mb: u64,
+    memory_limit_mb: usize,
     max_concurrent_requests: usize,
     max_concurrent_executions: usize,
     max_calls_per_execution: u32,
@@ -153,12 +130,13 @@ struct RawExecution {
 
 impl Default for RawExecution {
     fn default() -> Self {
+        let settings = ExecutionSettings::DEFAULT;
         Self {
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            memory_limit_mb: DEFAULT_MEMORY_LIMIT_MB,
-            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
-            max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
-            max_calls_per_execution: DEFAULT_MAX_CALLS_PER_EXECUTION,
+            timeout_seconds: settings.limits.timeout.as_secs(),
+            memory_limit_mb: settings.limits.memory_limit / BYTES_PER_MIB,
+            max_concurrent_requests: settings.max_concurrent_requests,
+            max_concurrent_executions: settings.max_concurrent_executions,
+            max_calls_per_execution: settings.max_calls_per_execution.get(),
         }
     }
 }
@@ -170,9 +148,8 @@ impl RawExecution {
         }
         let memory_limit = self
             .memory_limit_mb
-            .checked_mul(BYTES_PER_MB)
+            .checked_mul(BYTES_PER_MIB)
             .filter(|&bytes| bytes > 0)
-            .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or(ConfigError::InvalidMemoryLimit)?;
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_requests) {
             return Err(ConfigError::InvalidMaxConcurrentRequests);
@@ -205,7 +182,7 @@ impl RawProvider {
         Ok(Provider {
             endpoint,
             model: self.model,
-            api_key: ApiKey(self.api_key),
+            api_key: self.api_key,
         })
     }
 }
@@ -231,7 +208,7 @@ fn parse_endpoint(endpoint: &str) -> Option<Url> {
     })
 }
 
-pub fn load(args: impl IntoIterator<Item = OsString>) -> Result<Config, ConfigError> {
+pub(super) fn load(args: impl IntoIterator<Item = OsString>) -> Result<Config, ConfigError> {
     match parse_args(args)? {
         Some(path) => match read(&path)? {
             Some(source) => parse(path, &source),
