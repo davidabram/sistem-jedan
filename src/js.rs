@@ -9,6 +9,7 @@ use rquickjs::{
     AsyncContext, AsyncRuntime, CString, Ctx, Exception, Function, Object, Promise, Value, qjs,
 };
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::BYTES_PER_MIB;
 use crate::cpu::Throttle;
@@ -45,6 +46,8 @@ pub(super) enum JsError {
     Exception(String),
     #[error("execution exceeded the {}ms deadline", .0.as_millis())]
     Timeout(Duration),
+    #[error("execution cancelled")]
+    Cancelled,
     #[error("JavaScript allocation failed with a {0} byte execution memory limit")]
     OutOfMemory(NonZeroUsize),
     #[error("no value returned; use an explicit top-level `return`")]
@@ -85,6 +88,7 @@ impl JsError {
         match self {
             Self::Exception(_) => "exception",
             Self::Timeout(_) => TIMEOUT_KIND,
+            Self::Cancelled => "cancelled",
             Self::OutOfMemory(_) => OUT_OF_MEMORY_KIND,
             Self::MissingReturn => "missing_return",
             Self::UnsupportedResult(_) => "unsupported_result",
@@ -206,6 +210,7 @@ struct Execution {
     deadline: Instant,
     limits: Limits,
     allocation_failed: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 }
 
 impl Execution {
@@ -219,6 +224,8 @@ impl Execution {
             Some(JsError::Timeout(self.limits.timeout))
         } else if self.allocation_failed.load(Ordering::Relaxed) {
             Some(JsError::OutOfMemory(self.limits.memory_limit))
+        } else if self.cancellation.is_cancelled() {
+            Some(JsError::Cancelled)
         } else {
             None
         }
@@ -248,7 +255,7 @@ pub(super) async fn run(
     code: &str,
     limits: Limits,
     system1: Arc<System1>,
-    cancelled: impl Fn() -> bool + Send + 'static,
+    cancellation: CancellationToken,
 ) -> Result<serde_json::Value, JsError> {
     let deadline = Instant::now() + limits.timeout;
     let (allocator, allocation_failed) = LimitedAllocator::new(limits.memory_limit.get());
@@ -256,6 +263,7 @@ pub(super) async fn run(
         deadline,
         limits,
         allocation_failed,
+        cancellation,
     };
     let runtime = AsyncRuntime::new_with_alloc(allocator)
         .map_err(|error| execution.classify(error, None, None))?;
@@ -264,10 +272,13 @@ pub(super) async fn run(
     let mut throttle = limits.vcpu_per_execution.map(Throttle::new);
     runtime
         .set_interrupt_handler(Some(Box::new(move || {
+            if interrupt.failure().is_some() {
+                return true;
+            }
             if let Some(throttle) = &mut throttle {
                 throttle.pace(deadline);
             }
-            cancelled() || interrupt.failure().is_some()
+            interrupt.failure().is_some()
         })))
         .await;
     let context = AsyncContext::full(&runtime)
@@ -293,9 +304,13 @@ pub(super) async fn run(
             .failure()
             .map_or(result, |error| std::task::Poll::Ready(Err(error)))
     });
-    tokio::time::timeout_at(deadline.into(), guarded)
-        .await
-        .unwrap_or(Err(JsError::Timeout(limits.timeout)))
+    tokio::select! {
+        biased;
+        () = execution.cancellation.cancelled() => Err(JsError::Cancelled),
+        result = tokio::time::timeout_at(deadline.into(), guarded) => {
+            result.unwrap_or(Err(JsError::Timeout(limits.timeout)))
+        }
+    }
 }
 
 fn install<'js>(

@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use serde_json::json;
 
@@ -132,7 +133,7 @@ Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true
     async fn execute(
         &self,
         arguments: Option<rmcp::model::JsonObject>,
-        cancelled: impl Fn() -> bool + Send + 'static,
+        cancellation: CancellationToken,
     ) -> Result<CallToolResult, ExecuteError> {
         let code = arguments
             .as_ref()
@@ -157,7 +158,7 @@ Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true
         let runtime = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let result = runtime.block_on(js::run(&code, limits, system1, cancelled));
+            let result = runtime.block_on(js::run(&code, limits, system1, cancellation));
             memory::release_free_memory();
             result
         })
@@ -197,11 +198,10 @@ impl ServerHandler for Server {
     ) -> Result<CallToolResponse, ErrorData> {
         match request.name.as_ref() {
             EXECUTE => {
-                let cancellation = context.ct.clone();
                 let result = tokio::select! {
                     biased;
                     () = context.ct.cancelled() => return Err(ErrorData::internal_error("execution cancelled", None)),
-                    result = self.execute(request.arguments, move || cancellation.is_cancelled()) => {
+                    result = self.execute(request.arguments, context.ct.clone()) => {
                         if context.ct.is_cancelled() {
                             return Err(ErrorData::internal_error("execution cancelled", None));
                         }

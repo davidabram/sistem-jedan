@@ -29,14 +29,14 @@ impl Throttle {
         let wall = Instant::now();
         let cpu = thread_cpu_time();
         let earned = self.share * wall.duration_since(self.wall).as_secs_f64();
-        self.credit = (self.credit + earned).min(BURST.as_secs_f64())
-            - cpu.saturating_sub(self.cpu).as_secs_f64();
+        let consumed = cpu.saturating_sub(self.cpu).as_secs_f64();
+        self.credit = (self.credit + earned - consumed).min(BURST.as_secs_f64());
         self.wall = wall;
         self.cpu = cpu;
         if self.credit < 0.0 {
-            let pause = Duration::from_secs_f64(-self.credit / self.share)
-                .min(MAX_PAUSE)
-                .min(deadline.saturating_duration_since(wall));
+            let pause =
+                Duration::from_secs_f64((-self.credit / self.share).min(MAX_PAUSE.as_secs_f64()))
+                    .min(deadline.saturating_duration_since(wall));
             std::thread::sleep(pause);
         }
     }
