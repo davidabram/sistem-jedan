@@ -150,10 +150,6 @@ Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true
             .try_acquire_owned()
             .map_err(|_| ExecuteError::AtCapacity)?;
         tracing::info!(code_bytes = code.len(), "executing JavaScript");
-        // A dedicated thread keeps CPU-bound scripts off the async workers and
-        // lets the CPU throttle measure one thread for the whole execution.
-        // The permit moves with it so a cancelled call keeps its slot until
-        // the script has actually stopped.
         let code = code.to_owned();
         let limits = self.settings.limits;
         let system1 = Arc::clone(&self.system1);

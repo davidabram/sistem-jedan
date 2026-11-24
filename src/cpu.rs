@@ -3,9 +3,6 @@ use std::time::{Duration, Instant};
 const BURST: Duration = Duration::from_millis(10);
 const MAX_PAUSE: Duration = Duration::from_millis(10);
 
-/// Holds one thread to a share of a CPU by pausing it whenever its CPU time
-/// gets ahead of `share` × wall time. Idle time, such as waiting on
-/// `system1.decide()`, earns at most `BURST` of credit.
 pub(super) struct Throttle {
     share: f64,
     credit: f64,
@@ -23,8 +20,6 @@ impl Throttle {
         }
     }
 
-    /// Pauses for at most `MAX_PAUSE` so the caller can still observe
-    /// cancellation and the deadline; any remaining debt carries over.
     pub(super) fn pace(&mut self, deadline: Instant) {
         let wall = Instant::now();
         let cpu = thread_cpu_time();
@@ -47,7 +42,6 @@ fn thread_cpu_time() -> Duration {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `time` is a valid, writable timespec for the duration of the call.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) } != 0 {
         return Duration::ZERO;
     }
