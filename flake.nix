@@ -3,35 +3,59 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+    }:
     let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems =
+        f:
+        nixpkgs.lib.genAttrs systems (
+          system:
+          f (
+            import nixpkgs {
+              inherit system;
+              overlays = [ rust-overlay.overlays.default ];
+            }
+          )
+        );
+      toolchain = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
     in
     {
       packages = forAllSystems (pkgs: {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "sistem-jedan";
-          version = "0.1.0";
-          src = pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions [
-              ./Cargo.toml
-              ./Cargo.lock
-              ./src
-            ];
-          };
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeCheckInputs = [ pkgs.cacert ];
-          meta.mainProgram = "sistem-jedan";
-        };
+        default =
+          (pkgs.makeRustPlatform {
+            rustc = toolchain pkgs;
+            cargo = toolchain pkgs;
+          }).buildRustPackage
+            {
+              pname = "sistem-jedan";
+              version = "0.1.0";
+              src = pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./Cargo.toml
+                  ./Cargo.lock
+                  ./src
+                ];
+              };
+              cargoLock.lockFile = ./Cargo.lock;
+              nativeCheckInputs = [ pkgs.cacert ];
+              meta.mainProgram = "sistem-jedan";
+            };
       });
 
       checks = forAllSystems (pkgs: {
@@ -40,14 +64,7 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = [
-            pkgs.rustc
-            pkgs.cargo
-            pkgs.rustfmt
-            pkgs.clippy
-            pkgs.rust-analyzer
-          ];
-          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          packages = [ (toolchain pkgs) ];
         };
       });
 

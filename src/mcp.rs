@@ -119,12 +119,14 @@ impl ServerHandler for Server {
         }
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![self.execute_tool()]))
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> {
+        std::future::ready(Ok(ListToolsResult::with_all_items(vec![
+            self.execute_tool(),
+        ])))
     }
 
     async fn call_tool(

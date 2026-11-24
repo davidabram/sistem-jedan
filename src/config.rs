@@ -38,7 +38,7 @@ pub enum ConfigError {
         #[source]
         source: io::Error,
     },
-    #[error("invalid configuration in {}{}: {message}", .path.display(), .line.map(|line| format!(" at line {line}")).unwrap_or_default())]
+    #[error("invalid configuration in {}{}: {message}", .path.display(), .line.map_or_default(|line| format!(" at line {line}")))]
     Parse {
         path: PathBuf,
         line: Option<usize>,
