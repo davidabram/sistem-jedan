@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::time::Duration;
 
+use http_body_util::{LengthLimitError, Limited};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
@@ -193,8 +195,8 @@ pub(super) enum DecisionsError {
     Authentication { status: StatusCode, message: String },
     #[error("Decisions API returned HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
-    #[error("response is not a valid Decisions response: {0}")]
-    Decode(#[source] serde_json::Error),
+    #[error("response is not a valid Decisions response: {}", .0.source().unwrap_or(.0))]
+    Decode(#[source] reqwest::Error),
     #[error("invalid response: {0}")]
     InvalidResponse(#[source] ResponseError),
 }
@@ -275,36 +277,55 @@ impl Client {
             .send()
             .await
             .map_err(|error| self.transport(error))?;
-        let status = response.status();
-        let bytes = self.read_body(response).await?;
-        if !status.is_success() {
-            return Err(self.status_error(status, &bytes));
+        let error_status = match response.error_for_status_ref() {
+            Err(error) => error.status(),
+            Ok(_) if !response.status().is_success() => Some(response.status()),
+            Ok(_) => None,
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(DecisionsError::ResponseTooLarge);
         }
-        let response: Response = serde_json::from_slice(&bytes).map_err(DecisionsError::Decode)?;
+        let response: http::Response<reqwest::Body> = response.into();
+        let response = reqwest::Response::from(
+            response.map(|body| reqwest::Body::wrap(Limited::new(body, MAX_RESPONSE_BYTES))),
+        );
+        if let Some(status) = error_status {
+            let body = match response
+                .json()
+                .await
+                .map_err(|error| self.body_error(error))
+            {
+                Ok(body) => Some(body),
+                Err(DecisionsError::Decode(_)) => None,
+                Err(error) => return Err(error),
+            };
+            return Err(self.status_error(status, body));
+        }
+        let response: Response = response
+            .json()
+            .await
+            .map_err(|error| self.body_error(error))?;
         response
             .validate(request)
             .map_err(DecisionsError::InvalidResponse)?;
         Ok(response)
     }
 
-    async fn read_body(&self, mut response: reqwest::Response) -> Result<Vec<u8>, DecisionsError> {
-        let expected = match response.content_length().map(usize::try_from) {
-            Some(Ok(length)) if length <= MAX_RESPONSE_BYTES => length,
-            Some(_) => return Err(DecisionsError::ResponseTooLarge),
-            None => 0,
-        };
-        let mut body = Vec::with_capacity(expected);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| self.transport(error))?
-        {
-            if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
-                return Err(DecisionsError::ResponseTooLarge);
+    fn body_error(&self, error: reqwest::Error) -> DecisionsError {
+        let mut source = error.source();
+        while let Some(cause) = source {
+            if cause.is::<LengthLimitError>() {
+                return DecisionsError::ResponseTooLarge;
             }
-            body.extend_from_slice(&chunk);
+            if cause.is::<serde_json::Error>() {
+                return DecisionsError::Decode(error.without_url());
+            }
+            source = cause.source();
         }
-        Ok(body)
+        self.transport(error)
     }
 
     fn transport(&self, error: reqwest::Error) -> DecisionsError {
@@ -315,9 +336,9 @@ impl Client {
         }
     }
 
-    fn status_error(&self, status: StatusCode, body: &[u8]) -> DecisionsError {
-        let message = serde_json::from_slice::<ErrorBody>(body).map_or_else(
-            |_| {
+    fn status_error(&self, status: StatusCode, body: Option<ErrorBody>) -> DecisionsError {
+        let message = body.map_or_else(
+            || {
                 status
                     .canonical_reason()
                     .unwrap_or("unknown error")

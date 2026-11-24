@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ impl ExecutionSettings {
     const DEFAULT: Self = Self {
         limits: Limits {
             timeout: Duration::from_secs(5),
-            memory_limit: 64 * BYTES_PER_MIB,
+            memory_limit: NonZeroUsize::new(64 * BYTES_PER_MIB).unwrap(),
         },
         max_concurrent_requests: 8,
         max_concurrent_executions: 4,
@@ -133,7 +133,7 @@ impl Default for RawExecution {
         let settings = ExecutionSettings::DEFAULT;
         Self {
             timeout_seconds: settings.limits.timeout.as_secs(),
-            memory_limit_mb: settings.limits.memory_limit / BYTES_PER_MIB,
+            memory_limit_mb: settings.limits.memory_limit.get() / BYTES_PER_MIB,
             max_concurrent_requests: settings.max_concurrent_requests,
             max_concurrent_executions: settings.max_concurrent_executions,
             max_calls_per_execution: settings.max_calls_per_execution.get(),
@@ -149,7 +149,7 @@ impl RawExecution {
         let memory_limit = self
             .memory_limit_mb
             .checked_mul(BYTES_PER_MIB)
-            .filter(|&bytes| bytes > 0)
+            .and_then(NonZeroUsize::new)
             .ok_or(ConfigError::InvalidMemoryLimit)?;
         if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_requests) {
             return Err(ConfigError::InvalidMaxConcurrentRequests);

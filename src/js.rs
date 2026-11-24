@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub(super) const MAX_EXECUTE_RESULT_BYTES: usize = BYTES_PER_MIB;
 #[derive(Clone, Copy)]
 pub(super) struct Limits {
     pub(super) timeout: Duration,
-    pub(super) memory_limit: usize,
+    pub(super) memory_limit: NonZeroUsize,
 }
 
 pub(super) struct System1 {
@@ -44,7 +44,7 @@ pub(super) enum JsError {
     #[error("execution exceeded the {}ms deadline", .0.as_millis())]
     Timeout(Duration),
     #[error("JavaScript allocation failed with a {0} byte execution memory limit")]
-    OutOfMemory(usize),
+    OutOfMemory(NonZeroUsize),
     #[error("no value returned; use an explicit top-level `return`")]
     MissingReturn,
     #[error("result is not JSON-serializable: {0}")]
@@ -252,7 +252,7 @@ pub(super) async fn run(
     cancelled: impl Fn() -> bool + Send + 'static,
 ) -> Result<serde_json::Value, JsError> {
     let deadline = Instant::now() + limits.timeout;
-    let (allocator, allocation_failed) = LimitedAllocator::new(limits.memory_limit);
+    let (allocator, allocation_failed) = LimitedAllocator::new(limits.memory_limit.get());
     let execution = Execution {
         deadline,
         limits,

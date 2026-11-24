@@ -106,7 +106,7 @@ Limits per execution are {timeout} s, {memory} MiB of QuickJS backing allocation
 
 Execution errors return `{{"error": {{"kind", "message"}}}}` with `isError: true`. Excess executions fail immediately with `{capacity}`. Pending promises and running code both fail with `{TIMEOUT_KIND}` on deadline expiry. Allocator exhaustion fails with `{OUT_OF_MEMORY_KIND}`. Use an explicit return to avoid `{missing}` and filter or aggregate results to avoid `{too_large}`."#,
                 timeout = settings.limits.timeout.as_secs(),
-                memory = settings.limits.memory_limit / BYTES_PER_MIB,
+                memory = settings.limits.memory_limit.get() / BYTES_PER_MIB,
                 calls = settings.max_calls_per_execution,
                 executions = settings.max_concurrent_executions,
                 requests = settings.max_concurrent_requests,
