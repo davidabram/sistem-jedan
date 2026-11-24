@@ -7,4 +7,5 @@ api_key = "<your OpenRouter API key>"
 timeout_seconds = 5
 memory_limit_mb = 64
 max_concurrent_requests = 8
+max_concurrent_executions = 4
 max_calls_per_execution = 32

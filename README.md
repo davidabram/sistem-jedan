@@ -168,7 +168,8 @@ api_key = "<your OpenRouter API key>"
 [execution]                    # optional; defaults shown
 timeout_seconds = 5            # whole execution, including HTTP (1–3600)
 memory_limit_mb = 64           # QuickJS heap
-max_concurrent_requests = 8    # in-flight requests, shared across executions
+max_concurrent_requests = 8    # in-flight inference requests, shared across executions
+max_concurrent_executions = 4   # live QuickJS runtimes, shared across the server
 max_calls_per_execution = 32   # decide() calls per execute
 ```
 
@@ -178,22 +179,24 @@ Unknown keys are rejected. An invalid config is logged to stderr, and the server
 
 ## Limits and sandbox
 
-Every `execute` call gets a fresh QuickJS runtime. Scripts have no filesystem, environment variables, modules, timers or network access other than `system1.decide()`.
+Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no filesystem, environment variables, modules, timers or network access other than `system1.decide()`.
 
 | Limit | Exceeded → |
 | --- | --- |
 | `timeout_seconds` | `timeout` (also stops infinite loops) |
 | `memory_limit_mb` | `out_of_memory` |
+| `max_concurrent_executions` | `execution_capacity` immediately, before runtime creation |
 | `max_concurrent_requests` | extra calls queue, and the wait counts toward the deadline |
 | `max_calls_per_execution` | `call_limit_exceeded` |
+| 1 MiB of UTF-8 JavaScript source (fixed) | `invalid_arguments` |
 | 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (doesn't use up the call budget) |
 | 1 MiB of serialized UTF-8 JSON in the returned result (fixed) | `result_too_large` (filter or aggregate in JavaScript before returning) |
 
-The memory limit covers the JavaScript heap only, not the server's Rust allocations. Calls count toward the budget once their input passes validation, even if they fail later.
+The memory limit applies to QuickJS backing allocations for one runtime. The transport, HTTP client and Rust data have separate allocations. Calls count toward the budget once their input passes validation, even if they fail later.
 
 ## Errors
 
-An execution ends when the returned promise settles.
+An execution ends when the returned promise settles, the deadline expires, the runtime runs out of memory, or MCP cancels the request. Every deadline expiration is `timeout`, including when the returned promise stays pending. Execution diagnostics are limited to 8 KiB of UTF-8.
 
 - If the code returns nothing, it fails with `missing_return`. If the return value can't be converted to JSON, it fails with `unsupported_result`.
 - A rejection that propagates through the returned promise fails with `exception`.
@@ -205,7 +208,7 @@ A failed `execute` call returns `isError: true` with:
 { "error": { "kind": "timeout", "message": "execution exceeded the 5000ms deadline" } }
 ```
 
-The possible kinds are `invalid_arguments`, `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `result_too_large`, `engine` and `json`.
+The possible kinds are `invalid_arguments`, `execution_capacity`, `exception`, `timeout`, `out_of_memory`, `missing_return`, `unsupported_result`, `result_too_large`, `engine` and `json`.
 
 A failed `system1.decide()` call rejects with a `System1Error` that has a `kind` property:
 

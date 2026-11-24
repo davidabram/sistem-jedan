@@ -1,5 +1,6 @@
 mod config;
 mod decisions;
+mod diagnostic;
 mod js;
 mod mcp;
 mod memory;
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Error> {
         timeout_seconds = execution.limits.timeout.as_secs(),
         memory_limit_bytes = execution.limits.memory_limit,
         max_concurrent_requests = execution.max_concurrent_requests,
+        max_concurrent_executions = execution.max_concurrent_executions,
         max_calls_per_execution = execution.max_calls_per_execution,
         "execution limits"
     );
@@ -66,9 +68,13 @@ async fn main() -> Result<(), Error> {
         execution.max_concurrent_requests,
         execution.max_calls_per_execution,
     );
-    let service = mcp::Server::new(execution.limits, system1)
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let service = mcp::Server::new(
+        execution.limits,
+        system1,
+        execution.max_concurrent_executions,
+    )
+    .serve(rmcp::transport::stdio())
+    .await?;
     match service.waiting().await? {
         QuitReason::Closed => tracing::info!("client disconnected"),
         QuitReason::Cancelled => tracing::info!("session cancelled"),

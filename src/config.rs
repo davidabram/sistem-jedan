@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use reqwest::Url;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::js::Limits;
 
@@ -20,7 +21,8 @@ const DEFAULT_MEMORY_LIMIT_MB: u64 = 64;
     reason = "64 MiB fits in usize on every supported platform"
 )]
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = (DEFAULT_MEMORY_LIMIT_MB * BYTES_PER_MB) as usize;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 8;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 4;
 const DEFAULT_MAX_CALLS_PER_EXECUTION: u32 = 32;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
@@ -56,8 +58,16 @@ pub enum ConfigError {
     InvalidTimeout,
     #[error("execution.memory_limit_mb must be at least 1 and fit in addressable memory")]
     InvalidMemoryLimit,
-    #[error("execution.max_concurrent_requests must be at least 1")]
+    #[error(
+        "execution.max_concurrent_requests must be between 1 and {}",
+        Semaphore::MAX_PERMITS
+    )]
     InvalidMaxConcurrentRequests,
+    #[error(
+        "execution.max_concurrent_executions must be between 1 and {}",
+        Semaphore::MAX_PERMITS
+    )]
+    InvalidMaxConcurrentExecutions,
     #[error("execution.max_calls_per_execution must be at least 1")]
     InvalidMaxCallsPerExecution,
 }
@@ -86,7 +96,8 @@ pub struct Provider {
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionSettings {
     pub limits: Limits,
-    pub max_concurrent_requests: NonZeroU32,
+    pub max_concurrent_requests: usize,
+    pub max_concurrent_executions: usize,
     pub max_calls_per_execution: NonZeroU32,
 }
 
@@ -96,7 +107,8 @@ impl ExecutionSettings {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
         },
-        max_concurrent_requests: NonZeroU32::new(DEFAULT_MAX_CONCURRENT_REQUESTS).unwrap(),
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+        max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
         max_calls_per_execution: NonZeroU32::new(DEFAULT_MAX_CALLS_PER_EXECUTION).unwrap(),
     };
 }
@@ -134,7 +146,8 @@ struct RawProvider {
 struct RawExecution {
     timeout_seconds: u64,
     memory_limit_mb: u64,
-    max_concurrent_requests: u32,
+    max_concurrent_requests: usize,
+    max_concurrent_executions: usize,
     max_calls_per_execution: u32,
 }
 
@@ -144,6 +157,7 @@ impl Default for RawExecution {
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             memory_limit_mb: DEFAULT_MEMORY_LIMIT_MB,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_concurrent_executions: DEFAULT_MAX_CONCURRENT_EXECUTIONS,
             max_calls_per_execution: DEFAULT_MAX_CALLS_PER_EXECUTION,
         }
     }
@@ -160,13 +174,19 @@ impl RawExecution {
             .filter(|&bytes| bytes > 0)
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or(ConfigError::InvalidMemoryLimit)?;
+        if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_requests) {
+            return Err(ConfigError::InvalidMaxConcurrentRequests);
+        }
+        if !(1..=Semaphore::MAX_PERMITS).contains(&self.max_concurrent_executions) {
+            return Err(ConfigError::InvalidMaxConcurrentExecutions);
+        }
         Ok(ExecutionSettings {
             limits: Limits {
                 timeout: Duration::from_secs(self.timeout_seconds),
                 memory_limit,
             },
-            max_concurrent_requests: NonZeroU32::new(self.max_concurrent_requests)
-                .ok_or(ConfigError::InvalidMaxConcurrentRequests)?,
+            max_concurrent_requests: self.max_concurrent_requests,
+            max_concurrent_executions: self.max_concurrent_executions,
             max_calls_per_execution: NonZeroU32::new(self.max_calls_per_execution)
                 .ok_or(ConfigError::InvalidMaxCallsPerExecution)?,
         })
