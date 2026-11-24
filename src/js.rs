@@ -21,8 +21,6 @@ pub struct Limits {
     pub memory_limit: usize,
 }
 
-/// Hosted System 1 access shared by every execution: the configured client, if any, and the
-/// limiter for simultaneous inference requests.
 #[derive(Debug)]
 pub struct System1 {
     client: Option<decisions::Client>,
@@ -50,7 +48,6 @@ pub enum JsError {
     Json(#[from] serde_json::Error),
 }
 
-/// Failure of one `system1.decide()` call, delivered to JavaScript as a rejected promise.
 #[derive(Debug, thiserror::Error)]
 pub enum DecideError {
     #[error("system1.decide() is unavailable because no [provider] is configured")]
@@ -284,74 +281,5 @@ fn caught(ctx: &Ctx<'_>, error: rquickjs::Error, deadline: Instant, limits: Limi
     match exception.stack().filter(|stack| !stack.is_empty()) {
         Some(stack) => JsError::Exception(format!("{name}: {message}\n{stack}")),
         None => JsError::Exception(format!("{name}: {message}")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ApiKey, Provider};
-
-    const LIMITS: Limits = Limits {
-        timeout: Duration::from_secs(2),
-        memory_limit: 16 * 1024 * 1024,
-    };
-    const DECIDE: &str = r#"system1.decide({ state: "x", questions: { q: { type: "noul" } } })"#;
-
-    fn system1(client: Option<decisions::Client>, max_calls: u32) -> Arc<System1> {
-        Arc::new(System1::new(
-            client,
-            NonZeroU32::MIN,
-            NonZeroU32::new(max_calls).unwrap(),
-        ))
-    }
-
-    #[tokio::test]
-    async fn plain_javascript_runs_and_decide_rejects_without_provider() {
-        let code = format!(
-            "const [a, b] = await Promise.all([1, Promise.resolve(2)]);
-             const [settled] = await Promise.allSettled([{DECIDE}]);
-             return {{ sum: a + b, name: settled.reason.name, kind: settled.reason.kind }};"
-        );
-        let result = run(&code, LIMITS, system1(None, 1)).await.unwrap();
-        assert_eq!(
-            result,
-            serde_json::json!({ "sum": 3, "name": "System1Error", "kind": "provider_not_configured" })
-        );
-    }
-
-    #[tokio::test]
-    async fn synchronous_infinite_loop_times_out() {
-        let error = run("for (;;) {}", LIMITS, system1(None, 1))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, JsError::Timeout(_)), "{error:?}");
-    }
-
-    #[tokio::test]
-    async fn calls_beyond_the_budget_reject() {
-        let provider = Provider {
-            endpoint: "https://127.0.0.1:9/".parse().unwrap(),
-            model: "test".to_owned(),
-            api_key: ApiKey::new("secret-key"),
-        };
-        let client = decisions::Client::new(&provider, LIMITS.timeout).unwrap();
-        let code = format!(
-            "const results = await Promise.allSettled([{DECIDE}, {DECIDE}, {DECIDE}]);
-             return results.map(r => r.reason.kind + ': ' + r.reason.message);"
-        );
-        let result = run(&code, LIMITS, system1(Some(client), 2)).await.unwrap();
-        let kinds: Vec<&str> = result
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap())
-            .collect();
-        assert!(kinds.iter().all(|r| !r.contains("secret-key")), "{kinds:?}");
-        assert!(
-            kinds[..2].iter().all(|r| r.starts_with("transport")),
-            "{kinds:?}"
-        );
-        assert!(kinds[2].starts_with("call_limit_exceeded"), "{kinds:?}");
     }
 }

@@ -27,6 +27,8 @@ Why code instead of plain tool calls: when an agent has to ask a model about 50 
 
 Each call gets a fresh QuickJS runtime and context with no filesystem, environment, timers, or module access, and no network access other than `system1.decide()`. Execution is limited by a deadline (enforced with the QuickJS interrupt handler, so synchronous infinite loops are stopped) and a memory limit, 5 seconds and 64 MiB by default; see [Configuration](#configuration).
 
+An execution completes when the promise returned by the code settles: its resolved value becomes the result, and a rejection of the returned promise, or of any promise the code awaits without catching it (including through `Promise.all`), fails the execution with kind `exception`. Promises that are neither awaited nor returned are detached: they are not guaranteed to finish before the execution ends, and their rejections do not fail it. Awaiting a promise that never settles fails with `never_settled`, or with `timeout` if work such as an HTTP request is still pending at the deadline.
+
 Failures return a tool error (`isError: true`) with structured content `{ "error": { "kind", "message" } }`, where `kind` is one of `exception`, `timeout`, `out_of_memory`, `never_settled`, `missing_return`, `unsupported_result`, `engine`, or `json`. Invalid arguments produce a plain tool error; unknown tool names produce a JSON-RPC `-32602` error.
 
 ## System 1 decisions
@@ -48,7 +50,7 @@ const results = await Promise.all(commits.map(async commit => {
 return results.filter(x => x.probability > 0.7);
 ```
 
-A failed call rejects its promise with an `Error` named `System1Error` whose `kind` is one of `provider_not_configured`, `call_limit_exceeded`, `invalid_input`, `timeout`, `transport`, `authentication`, `http`, `invalid_response`, `encode`, or `limiter_closed`, so failures can be handled with `try`/`catch` or `Promise.allSettled`. Error messages never contain the API key. A rejection that is never handled fails the execution with kind `exception`.
+A failed call rejects its promise with an `Error` named `System1Error` whose `kind` is one of `provider_not_configured`, `call_limit_exceeded`, `invalid_input`, `timeout`, `transport`, `authentication`, `http`, `invalid_response`, `encode`, or `limiter_closed`, so failures can be handled with `try`/`catch` or `Promise.allSettled`. Error messages never contain the API key.
 
 The execution deadline covers HTTP calls too; when it expires, pending requests are cancelled. At most `max_concurrent_requests` requests are in flight at once across all executions, and each execution may initiate at most `max_calls_per_execution` calls (calls rejected for invalid input do not count).
 

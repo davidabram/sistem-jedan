@@ -17,7 +17,6 @@ const MIN_SCORE_LEVELS: usize = 2;
 const MAX_NESTING_DEPTH: usize = 64;
 const REDACTED: &str = "<redacted>";
 
-/// A Decisions API request: the `state` to judge and the named questions to answer about it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -28,20 +27,17 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Question {
-    /// Yes/no question answered with the probability of `true`.
     Noul {
         #[serde(skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
-    /// Picks one of the named choices, mapping each name to its description.
     Choice {
         #[serde(skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
         criteria: BTreeMap<String, String>,
     },
-    /// Places the state on an ordered scale, lowest level first.
     Score {
         #[serde(skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
@@ -61,7 +57,6 @@ pub struct NoulCriteria {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub id: Option<String>,
-    /// The exact model build that answered.
     pub model: String,
     pub provider: Option<String>,
     pub answers: BTreeMap<String, Answer>,
@@ -74,20 +69,17 @@ pub enum Answer {
     Noul(NoulAnswer),
     Choice(ChoiceAnswer),
     Score(ScoreAnswer),
-    /// The provider declined to answer this question.
     Refusal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoulAnswer {
-    /// Probability of `true`, from 0 to 1.
     pub noul: f64,
     pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChoiceAnswer {
-    /// The winning choice name.
     pub choice: String,
     pub probabilities: Option<BTreeMap<String, f64>>,
     pub confidence: Option<f64>,
@@ -95,11 +87,8 @@ pub struct ChoiceAnswer {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoreAnswer {
-    /// Probability-weighted position on the 0-indexed scale, from 0 to the number of levels minus 1.
     pub score: f64,
-    /// Probability per 0-indexed level, keyed by the level index as a string.
     pub probabilities: Option<BTreeMap<String, f64>>,
-    /// Criterion text per 0-indexed level, keyed by the level index as a string.
     pub legend: Option<BTreeMap<String, String>>,
     pub confidence: Option<f64>,
 }
@@ -108,7 +97,6 @@ pub struct ScoreAnswer {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Amount `OpenRouter` charged for the request.
     pub cost: Option<f64>,
     pub input_tokens_details: Option<InputTokensDetails>,
     pub cost_details: Option<CostDetails>,
@@ -225,7 +213,6 @@ impl DecisionsError {
     }
 }
 
-/// Reusable Decisions API client bound to one endpoint, model and API key.
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
