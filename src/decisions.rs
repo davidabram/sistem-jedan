@@ -260,7 +260,6 @@ impl Client {
     }
 
     pub async fn decide(&self, request: &Request) -> Result<Response, DecisionsError> {
-        request.validate()?;
         let body = Body {
             model: &self.model,
             state: &request.state,

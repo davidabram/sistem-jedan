@@ -15,7 +15,11 @@ const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const DEFAULT_MEMORY_LIMIT_MB: u64 = 64;
-const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "64 MiB fits in usize on every supported platform"
+)]
+const DEFAULT_MEMORY_LIMIT_BYTES: usize = (DEFAULT_MEMORY_LIMIT_MB * BYTES_PER_MB) as usize;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: u32 = 8;
 const DEFAULT_MAX_CALLS_PER_EXECUTION: u32 = 32;
 const BYTES_PER_MB: u64 = 1024 * 1024;

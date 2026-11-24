@@ -14,6 +14,7 @@ use crate::decisions::{self, DecisionsError, Request};
 
 pub const STACK_LIMIT: usize = 512 * 1024;
 const SYSTEM1_ERROR: &str = "System1Error";
+pub const MAX_DECISION_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -56,6 +57,8 @@ pub enum DecideError {
     CallLimitExceeded(NonZeroU32),
     #[error("decision input is not JSON-serializable: {0}")]
     Unserializable(String),
+    #[error("serialized decision input exceeds the {MAX_DECISION_INPUT_BYTES} byte limit")]
+    InputTooLarge,
     #[error("invalid decision input: {0}")]
     InvalidInput(#[source] serde_json::Error),
     #[error(transparent)]
@@ -88,7 +91,9 @@ impl DecideError {
         match self {
             Self::ProviderNotConfigured => "provider_not_configured",
             Self::CallLimitExceeded(_) => "call_limit_exceeded",
-            Self::Unserializable(_) | Self::InvalidInput(_) => "invalid_input",
+            Self::Unserializable(_) | Self::InputTooLarge | Self::InvalidInput(_) => {
+                "invalid_input"
+            }
             Self::Decisions(error) => error.kind(),
             Self::Encode(_) => "encode",
             Self::LimiterClosed => "limiter_closed",
@@ -125,6 +130,11 @@ impl System1 {
         }
     }
 
+    #[must_use]
+    pub fn max_calls(&self) -> NonZeroU32 {
+        self.max_calls
+    }
+
     fn prepare<'js>(
         &self,
         ctx: &Ctx<'js>,
@@ -136,7 +146,7 @@ impl System1 {
         }
         let json = match ctx.json_stringify(input).catch(ctx) {
             Ok(Some(json)) => json
-                .to_string()
+                .to_cstring()
                 .map_err(|error| DecideError::Unserializable(error.to_string()))?,
             Ok(None) => {
                 return Err(DecideError::Unserializable(
@@ -145,7 +155,11 @@ impl System1 {
             }
             Err(error) => return Err(DecideError::Unserializable(caught_message(&error))),
         };
-        let request: Request = serde_json::from_str(&json).map_err(DecideError::InvalidInput)?;
+        if json.len() > MAX_DECISION_INPUT_BYTES {
+            return Err(DecideError::InputTooLarge);
+        }
+        let request: Request =
+            serde_json::from_str(json.as_str()).map_err(DecideError::InvalidInput)?;
         request.validate().map_err(DecisionsError::from)?;
         let left = remaining
             .get()
