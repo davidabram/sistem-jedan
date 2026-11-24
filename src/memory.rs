@@ -8,8 +8,6 @@ use rquickjs::allocator::Allocator;
 #[repr(C, align(8))]
 struct Header(Layout);
 
-/// Counts the total size of live backing layouts, including this allocator's
-/// headers and all `QuickJS` allocations made during runtime initialization.
 pub(super) struct LimitedAllocator {
     limit: usize,
     used: usize,
@@ -48,9 +46,6 @@ impl LimitedAllocator {
         used
     }
 
-    /// # Safety
-    /// The base must be a live allocation made with this layout which includes
-    /// space for an aligned header and a nonempty payload.
     unsafe fn init_header(base: NonNull<u8>, layout: Layout) -> *mut u8 {
         unsafe {
             base.cast::<Header>().write(Header(layout));
@@ -58,8 +53,6 @@ impl LimitedAllocator {
         }
     }
 
-    /// # Safety
-    /// The pointer must be a live payload previously returned by this allocator.
     unsafe fn read_header(payload: NonNull<u8>) -> (NonNull<u8>, Layout) {
         let base = unsafe { payload.sub(size_of::<Header>()) };
         (base, unsafe { base.cast::<Header>().read().0 })
@@ -90,9 +83,6 @@ impl LimitedAllocator {
     }
 }
 
-/// The header keeps payloads aligned to at least both `usize` and `u64`.
-/// Only a successful global allocation publishes a payload or changes the
-/// charge. `QuickJS` uses the payload size, excluding the header, as usable size.
 unsafe impl Allocator for LimitedAllocator {
     fn alloc(&mut self, size: usize) -> *mut u8 {
         self.allocate(size, false)

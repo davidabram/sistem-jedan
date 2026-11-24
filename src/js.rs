@@ -212,9 +212,6 @@ impl Execution {
             .map_or(Ok(()), |_| Err(rquickjs::Error::Unknown))
     }
 
-    /// A backing allocation failure ends the execution. `QuickJS` can throw
-    /// an ordinary JavaScript Error on exhaustion and exposes no reliable tag
-    /// that distinguishes it from a later user exception.
     fn failure(&self) -> Option<JsError> {
         if Instant::now() >= self.deadline {
             Some(JsError::Timeout(self.limits.timeout))
@@ -387,8 +384,6 @@ fn describe_exception<'js>(value: &Value<'js>, stack_getter: Option<&Function<'j
     format!("Uncaught {text}")
 }
 
-/// Only ordinary prototypes are inspected. Comparing class IDs of the live
-/// prototype and global object neither reads properties nor invokes a trap.
 fn inherited_error_name(value: &Value<'_>) -> Option<String> {
     let prototype = value.as_object()?.get_prototype()?;
     let global = value.ctx().globals();
@@ -398,9 +393,6 @@ fn inherited_error_name(value: &Value<'_>) -> Option<String> {
     error_property(prototype.as_value(), qjs::JS_ATOM_name, 256)
 }
 
-/// Reads a predefined own property of a native Error or an ordinary object.
-/// A positive result initializes the descriptor and transfers all three
-/// value references from the same context. Accessor functions are only freed.
 fn error_property(value: &Value<'_>, key: qjs::JSAtom, budget: usize) -> Option<String> {
     let ctx = value.ctx();
     let raw = ctx.as_raw().as_ptr();
@@ -436,7 +428,6 @@ fn string_preview(value: &Value<'_>, budget: usize) -> Option<String> {
     ))
 }
 
-/// Reads only the initialized bytes of the buffer retained by `CString`.
 fn c_bytes<'a>(text: &'a CString<'_>) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(text.as_ptr().cast(), text.len()) }
 }
