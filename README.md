@@ -167,7 +167,7 @@ api_key = "<your OpenRouter API key>"
 
 [execution]                    # optional; defaults shown
 timeout_seconds = 5            # whole execution, including HTTP (1–3600)
-memory_limit_mb = 64           # QuickJS heap
+memory_limit_mb = 64           # QuickJS backing allocations
 max_concurrent_requests = 8    # in-flight inference requests, shared across executions
 max_concurrent_executions = 4   # live QuickJS runtimes, shared across the server
 max_calls_per_execution = 32   # decide() calls per execute
@@ -192,7 +192,7 @@ Every admitted `execute` call gets a fresh QuickJS runtime. Scripts have no file
 | 1 MiB of serialized JSON per `decide()` argument (fixed) | `invalid_input` (doesn't use up the call budget) |
 | 1 MiB of serialized UTF-8 JSON in the returned result (fixed) | `result_too_large` (filter or aggregate in JavaScript before returning) |
 
-The memory limit applies to QuickJS backing allocations for one runtime. The transport, HTTP client and Rust data have separate allocations. Calls count toward the budget once their input passes validation, even if they fail later.
+The memory limit counts live QuickJS backing allocations, including runtime initialization, arenas and allocator headers. It excludes global allocator overhead, any temporary space used internally by the global allocator during reallocation, and separate allocations made by Rust, the transport or the HTTP client. Calls count toward the budget once their input passes validation, even if they fail later.
 
 ## Errors
 

@@ -1,141 +1,145 @@
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
+use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rquickjs::allocator::{Allocator, RustAllocator};
+use rquickjs::allocator::Allocator;
 
-const ALLOC_ALIGN: usize = std::mem::align_of::<u64>();
-const HEADER_SIZE: usize = if std::mem::size_of::<usize>() < ALLOC_ALIGN {
-    ALLOC_ALIGN
-} else {
-    std::mem::size_of::<usize>()
-};
+#[repr(C, align(8))]
+struct Header(Layout);
 
-pub struct LimitedAllocator {
+/// Counts the total size of live backing layouts, including this allocator's
+/// headers and all `QuickJS` allocations made during runtime initialization.
+pub(super) struct LimitedAllocator {
     limit: usize,
     used: usize,
-    exceeded: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
 }
 
 impl LimitedAllocator {
-    pub fn new(limit: usize) -> (Self, Arc<AtomicBool>) {
-        let exceeded = Arc::new(AtomicBool::new(false));
+    pub(super) fn new(limit: usize) -> (Self, Arc<AtomicBool>) {
+        let failed = Arc::new(AtomicBool::new(false));
         let allocator = Self {
             limit,
             used: 0,
-            exceeded: Arc::clone(&exceeded),
+            failed: Arc::clone(&failed),
         };
-        (allocator, exceeded)
+        (allocator, failed)
     }
 
-    fn mark_exceeded(&self) {
-        self.exceeded.store(true, Ordering::Relaxed);
+    fn fail(&self) -> *mut u8 {
+        self.failed.store(true, Ordering::Relaxed);
+        ptr::null_mut()
     }
 
-    fn rounded_size(size: usize) -> Option<usize> {
-        let rounded = size.checked_add(ALLOC_ALIGN - 1)? / ALLOC_ALIGN;
-        let rounded = rounded.checked_mul(ALLOC_ALIGN)?;
-        rounded.checked_add(HEADER_SIZE)?;
-        Some(rounded)
+    fn layout(size: usize) -> Option<Layout> {
+        Layout::from_size_align(size.checked_add(size_of::<Header>())?, align_of::<Header>()).ok()
     }
 
-    fn reserve(&mut self, size: usize) -> Option<usize> {
-        match self.used.checked_add(size) {
-            Some(used) if used <= self.limit => Some(used),
-            _ => {
-                self.mark_exceeded();
-                None
-            }
+    fn reserve(&self, used: usize, layout: Layout) -> Option<usize> {
+        used.checked_add(layout.size())
+            .filter(|&used| used <= self.limit)
+    }
+
+    fn without(&self, layout: Layout) -> usize {
+        let Some(used) = self.used.checked_sub(layout.size()) else {
+            std::process::abort();
+        };
+        used
+    }
+
+    /// # Safety
+    /// The base must be a live allocation made with this layout which includes
+    /// space for an aligned header and a nonempty payload.
+    unsafe fn init_header(base: NonNull<u8>, layout: Layout) -> *mut u8 {
+        unsafe {
+            base.cast::<Header>().write(Header(layout));
+            base.add(size_of::<Header>()).as_ptr()
         }
+    }
+
+    /// # Safety
+    /// The pointer must be a live payload previously returned by this allocator.
+    unsafe fn read_header(payload: NonNull<u8>) -> (NonNull<u8>, Layout) {
+        let base = unsafe { payload.sub(size_of::<Header>()) };
+        (base, unsafe { base.cast::<Header>().read().0 })
+    }
+
+    fn allocate(&mut self, size: usize, zeroed: bool) -> *mut u8 {
+        if size == 0 {
+            return ptr::null_mut();
+        }
+        let Some(layout) = Self::layout(size) else {
+            return self.fail();
+        };
+        let Some(used) = self.reserve(self.used, layout) else {
+            return self.fail();
+        };
+        let raw = unsafe {
+            if zeroed {
+                alloc_zeroed(layout)
+            } else {
+                alloc(layout)
+            }
+        };
+        let Some(base) = NonNull::new(raw) else {
+            return self.fail();
+        };
+        self.used = used;
+        unsafe { Self::init_header(base, layout) }
     }
 }
 
+/// The header keeps payloads aligned to at least both `usize` and `u64`.
+/// Only a successful global allocation publishes a payload or changes the
+/// charge. `QuickJS` uses the payload size, excluding the header, as usable size.
 unsafe impl Allocator for LimitedAllocator {
     fn alloc(&mut self, size: usize) -> *mut u8 {
-        let Some(usable_size) = Self::rounded_size(size) else {
-            self.mark_exceeded();
-            return std::ptr::null_mut();
-        };
-        let Some(used) = self.reserve(usable_size) else {
-            return std::ptr::null_mut();
-        };
-        let ptr = RustAllocator.alloc(size);
-        if !ptr.is_null() {
-            self.used = used;
-        }
-        ptr
+        self.allocate(size, false)
     }
 
     fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
-        let Some(total) = count.checked_mul(size) else {
-            self.mark_exceeded();
-            return std::ptr::null_mut();
-        };
-        let Some(usable_size) = Self::rounded_size(total) else {
-            self.mark_exceeded();
-            return std::ptr::null_mut();
-        };
-        let Some(used) = self.reserve(usable_size) else {
-            return std::ptr::null_mut();
-        };
-        let ptr = if total == 0 {
-            RustAllocator.alloc(0)
-        } else {
-            RustAllocator.calloc(count, size)
-        };
-        if !ptr.is_null() {
-            self.used = used;
+        match count.checked_mul(size) {
+            Some(total) => self.allocate(total, true),
+            None => self.fail(),
         }
-        ptr
     }
 
-    unsafe fn dealloc(&mut self, ptr: *mut u8) {
-        if ptr.is_null() {
-            return;
+    unsafe fn dealloc(&mut self, raw: *mut u8) {
+        if let Some(payload) = NonNull::new(raw) {
+            let (base, layout) = unsafe { Self::read_header(payload) };
+            self.used = self.without(layout);
+            unsafe { dealloc(base.as_ptr(), layout) };
         }
-        let usable_size = unsafe { RustAllocator::usable_size(ptr) };
-        let Some(used) = self.used.checked_sub(usable_size) else {
-            self.mark_exceeded();
-            unsafe { RustAllocator.dealloc(ptr) };
-            return;
+    }
+
+    unsafe fn realloc(&mut self, raw: *mut u8, size: usize) -> *mut u8 {
+        let Some(payload) = NonNull::new(raw) else {
+            return self.alloc(size);
+        };
+        if size == 0 {
+            unsafe { self.dealloc(raw) };
+            return ptr::null_mut();
+        }
+        let Some(layout) = Self::layout(size) else {
+            return self.fail();
+        };
+        let (base, old_layout) = unsafe { Self::read_header(payload) };
+        let Some(used) = self.reserve(self.without(old_layout), layout) else {
+            return self.fail();
+        };
+        let resized = unsafe { realloc(base.as_ptr(), old_layout, layout.size()) };
+        let Some(base) = NonNull::new(resized) else {
+            return self.fail();
         };
         self.used = used;
-        unsafe { RustAllocator.dealloc(ptr) };
+        unsafe { Self::init_header(base, layout) }
     }
 
-    unsafe fn realloc(&mut self, ptr: *mut u8, new_size: usize) -> *mut u8 {
-        if ptr.is_null() {
-            return self.alloc(new_size);
-        }
-        let Some(new_usable_size) = Self::rounded_size(new_size) else {
-            self.mark_exceeded();
-            return std::ptr::null_mut();
-        };
-        let old_usable_size = unsafe { RustAllocator::usable_size(ptr) };
-        let new_used = if new_usable_size >= old_usable_size {
-            let growth = new_usable_size - old_usable_size;
-            let Some(used) = self.reserve(growth) else {
-                return std::ptr::null_mut();
-            };
-            used
-        } else {
-            let shrink = old_usable_size - new_usable_size;
-            let Some(used) = self.used.checked_sub(shrink) else {
-                self.mark_exceeded();
-                return std::ptr::null_mut();
-            };
-            used
-        };
-        let new_ptr = unsafe { RustAllocator.realloc(ptr, new_size) };
-        if !new_ptr.is_null() {
-            self.used = new_used;
-        }
-        new_ptr
-    }
-
-    unsafe fn usable_size(ptr: *mut u8) -> usize {
-        if ptr.is_null() {
-            return 0;
-        }
-        unsafe { RustAllocator::usable_size(ptr) }
+    unsafe fn usable_size(raw: *mut u8) -> usize {
+        NonNull::new(raw).map_or(0, |payload| {
+            let (_, layout) = unsafe { Self::read_header(payload) };
+            layout.size() - size_of::<Header>()
+        })
     }
 }
